@@ -3,6 +3,8 @@
 [![PyPI version](https://img.shields.io/pypi/v/yyds-lock.svg)](https://pypi.org/project/yyds-lock/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+[中文文档](README_CN.md)
+
 `yyds-lock` is an ultra-lightweight, zero-dependency Python library that guarantees single-instance execution of scripts/processes using operating system level advisory file locks. It is ideal for cron jobs, automation scripts, schedulers, and background daemons.
 
 ## Key Features

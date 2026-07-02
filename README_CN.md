@@ -3,6 +3,8 @@
 [![PyPI version](https://img.shields.io/pypi/v/yyds-lock.svg)](https://pypi.org/project/yyds-lock/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+[English](README.md)
+
 `yyds-lock` 是一个极其轻量级、**零依赖（Zero-dependency）** 的 Python 进程单例锁工具库。它通过操作系统底层的建议性文件锁（Advisory File Lock）来保证同一时间只有一个脚本实例处于运行状态。非常适合定时任务（Crontab）、自动化脚本、抢票爬虫以及各种后台服务进程。
 
 ## 核心特性
