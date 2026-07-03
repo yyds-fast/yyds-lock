@@ -9,7 +9,7 @@ import subprocess
 # Add the parent directory to Python path to import yyds_lock
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from yyds_lock import force_single, release_single, single_decorator
+from yyds_lock import force_single, release_single, single_decorator, AlreadyLockedError
 
 
 class TestYYDSLock(unittest.TestCase):
@@ -190,6 +190,127 @@ class TestYYDSLock(unittest.TestCase):
         proc_hold.stdout.close()
         proc_hold.stderr.close()
         proc_hold.wait()
+
+    def test_concurrent_threads_lock(self):
+        import threading
+        errors = []
+        
+        def run_thread():
+            try:
+                # Both threads try to acquire the lock
+                force_single(self.test_lock_name, block=False)
+                time.sleep(0.2)
+                release_single(self.test_lock_name)
+            except Exception as e:
+                errors.append(e)
+            except SystemExit as e:
+                errors.append(SystemExit(e.code))
+
+        t1 = threading.Thread(target=run_thread)
+        t2 = threading.Thread(target=run_thread)
+        
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        
+        self.assertEqual(len(errors), 0, f"Expected no errors, but got: {errors}")
+
+    def test_raise_on_conflict(self):
+        # 1. Start a subprocess that holds the lock
+        code_hold = (
+            "import time, sys, os\n"
+            "sys.path.insert(0, os.path.abspath('.'))\n"
+            f"from yyds_lock import force_single\n"
+            f"force_single('{self.test_lock_name}', block=False)\n"
+            "print('LOCKED', flush=True)\n"
+            "time.sleep(2)\n"
+        )
+        
+        proc_hold = subprocess.Popen(
+            [sys.executable, "-c", code_hold],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        # Wait for background process to output "LOCKED"
+        output = proc_hold.stdout.readline().strip()
+        self.assertEqual(output, "LOCKED")
+        
+        # 2. Now try to acquire the same lock in this process with raise_on_conflict=True
+        with self.assertRaises(AlreadyLockedError):
+            force_single(self.test_lock_name, block=False, raise_on_conflict=True)
+            
+        # Cleanup
+        proc_hold.stdout.close()
+        proc_hold.stderr.close()
+        proc_hold.wait()
+
+    def test_decorator_raise_on_conflict(self):
+        # 1. Start a subprocess that holds the lock
+        code_hold = (
+            "import time, sys, os\n"
+            "sys.path.insert(0, os.path.abspath('.'))\n"
+            f"from yyds_lock import force_single\n"
+            f"force_single('{self.test_lock_name}', block=False)\n"
+            "print('LOCKED', flush=True)\n"
+            "time.sleep(2)\n"
+        )
+        
+        proc_hold = subprocess.Popen(
+            [sys.executable, "-c", code_hold],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        # Wait for background process to output "LOCKED"
+        output = proc_hold.stdout.readline().strip()
+        self.assertEqual(output, "LOCKED")
+        
+        @single_decorator(lock_name=self.test_lock_name, block=False, raise_on_conflict=True)
+        def my_decorated_func():
+            pass
+            
+        # 2. Try running decorated function - it should raise AlreadyLockedError
+        with self.assertRaises(AlreadyLockedError):
+            my_decorated_func()
+            
+        # Cleanup
+        proc_hold.stdout.close()
+        proc_hold.stderr.close()
+        proc_hold.wait()
+
+    def test_canonical_path_resolution(self):
+        # Create a symlink to test canonical path resolution
+        # Let's create two different paths that point to the same physical file
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_file = os.path.join(tmpdir, "real_file.lock")
+            symlink_file = os.path.join(tmpdir, "symlink_file.lock")
+            
+            # Create target file first so symlink works
+            with open(target_file, "w") as f:
+                f.write("")
+                
+            os.symlink(target_file, symlink_file)
+            
+            # Now, acquiring target_file should be reentrant with acquiring symlink_file
+            try:
+                force_single(target_file, block=False)
+                # Since they resolve to the same canonical path, the second acquisition
+                # should just increment the reference count instead of attempting a new file lock
+                force_single(symlink_file, block=False)
+                
+                # Check ref count
+                from yyds_lock.core import _lock_file_handles, _resolve_lock_path
+                canonical_path = _resolve_lock_path(target_file)
+                self.assertEqual(_lock_file_handles[canonical_path]["ref_count"], 2)
+                
+            finally:
+                release_single(symlink_file)
+                release_single(target_file)
 
 
 if __name__ == "__main__":

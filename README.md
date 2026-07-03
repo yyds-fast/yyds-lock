@@ -26,7 +26,7 @@ pip install -U yyds-lock
 
 ## Usage
 
-You can protect your script using either of two simple approaches:
+You can protect your script using any of the following approaches:
 
 ### Pattern A: Direct Call (Best for straightforward scripts / entrypoints)
 
@@ -58,6 +58,21 @@ if __name__ == "__main__":
     main()
 ```
 
+### Pattern C: Handle Lock Conflict (Exception Raising)
+
+If you prefer to handle the locking failure programmatically (e.g., to perform custom cleanups, log warnings, or run fallback logic) instead of immediately terminating the process, set `raise_on_conflict=True` to raise `AlreadyLockedError`:
+
+```python
+import yyds_lock
+from yyds_lock import AlreadyLockedError
+
+try:
+    yyds_lock.force_single(lock_name="my_automation.lock", block=False, raise_on_conflict=True)
+except AlreadyLockedError:
+    print("Failed to acquire lock. Running fallback script instead...")
+    # Add custom fallback actions here
+```
+
 ---
 
 ## Configuration / Arguments
@@ -70,6 +85,9 @@ Both `force_single` and `single_decorator` accept the following arguments:
 - `block` (bool):
   - `False` (default): Exit immediately if the lock cannot be acquired.
   - `True`: Block and queue, waiting for the active process to finish and release the lock.
+- `raise_on_conflict` (bool):
+  - `False` (default): Immediately print an error and call `sys.exit(1)` when the lock is already held.
+  - `True`: Raise `AlreadyLockedError` when the lock is already held, allowing the caller to catch it.
 
 ---
 
@@ -79,3 +97,4 @@ Both `force_single` and `single_decorator` accept the following arguments:
 2. **Windows**: Uses `msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)` to lock the first byte of the file.
 3. The library stores the open file handles in a global dictionary inside the Python runtime. This keeps the file descriptor open and prevents garbage collection (GC) from releasing the lock prematurely.
 4. When the process terminates (normally, via Exception, `sys.exit`, crash, `kill -9`, or power failure), the OS closes the file descriptors, releasing the locks instantly.
+

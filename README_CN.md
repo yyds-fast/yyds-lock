@@ -26,7 +26,7 @@ pip install -U yyds-lock
 
 ## 使用姿势
 
-您可以通过以下两种极其简单的方式保护您的脚本：
+您可以通过以下几种简单的方式保护您的脚本：
 
 ### 姿势 A：直接调用（适合平铺直叙的单兵脚本）
 
@@ -58,6 +58,21 @@ if __name__ == "__main__":
     main()
 ```
 
+### 姿势 C：处理锁冲突（抛出异常模式）
+
+如果您不希望直接退出进程，而是希望通过代码捕捉锁冲突（例如执行自定义清理逻辑、打印日志告警、或者执行降级任务），可以设置 `raise_on_conflict=True` 使得在发生冲突时抛出 `AlreadyLockedError` 异常：
+
+```python
+import yyds_lock
+from yyds_lock import AlreadyLockedError
+
+try:
+    yyds_lock.force_single(lock_name="my_automation.lock", block=False, raise_on_conflict=True)
+except AlreadyLockedError:
+    print("未能成功获取锁，正在执行降级脚本...")
+    # 在这里添加自定义的降级/备份逻辑
+```
+
 ---
 
 ## 配置参数说明
@@ -68,8 +83,11 @@ if __name__ == "__main__":
   - 如果仅传入文件名（如 `"my_job.lock"`），锁文件会自动创建在用户家目录（`~`）下。
   - 如果传入的是相对路径或绝对路径（如 `"/var/run/my_job.lock"`），则会在对应路径创建。如果父级目录不存在，会自动创建。
 - `block` (bool)：
-  - `False`（默认值）：非阻塞模式。如果发现锁已被占用，立即打印错误并退出程序。
+  - `False`（默认值）：非阻塞模式。如果发现锁已被占用，立即引发冲突处理。
   - `True`：阻塞排队模式。如果发现锁已被占用，当前实例会处于挂起等待状态，直到上一个实例结束并释放锁后，才接棒继续运行。
+- `raise_on_conflict` (bool)：
+  - `False`（默认值）：锁被占用时，直接向 stderr 输出错误并以退出码 `1` 退出进程。
+  - `True`：锁被占用时，抛出 `AlreadyLockedError` 异常，允许调用者捕获并进行自定义处理。
 
 ---
 
@@ -79,3 +97,4 @@ if __name__ == "__main__":
 2. **Windows**：底层调用 `msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)` 对文件的首字节加锁。
 3. 为了防止 Python 的垃圾回收机制（GC）在垃圾回收时过早自动关闭文件描述符导致锁失效，本库会在内存中使用全局字典保持对文件句柄的引用。
 4. 一旦进程退出（无论是正常退出、遭遇未捕获异常、通过 `sys.exit` 退出，还是被 `kill -9` 强杀或断电关机），操作系统内核都会回收进程所占有的所有文件描述符，此时文件锁将被**瞬间释放**。
+
