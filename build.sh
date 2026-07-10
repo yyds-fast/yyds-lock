@@ -4,3 +4,5 @@
 rm -rf dist build yyds_lock.egg-info
 
 python -m build
+
+python -m twine upload dist/*
