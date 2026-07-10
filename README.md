@@ -80,7 +80,7 @@ except AlreadyLockedError:
 Both `force_single` and `single_decorator` accept the following arguments:
 
 - `lock_name` (str): The filename/path of the lock.
-  - If a simple filename is given (e.g. `"my_job.lock"`), it is automatically created in the user's home directory (`~`).
+  - If a simple filename is given (e.g. `"my_job.lock"`), it is automatically created in a hidden directory `.yyds_lock` under the user's home directory (`~/.yyds_lock`).
   - If an absolute or relative path is given (e.g., `"/var/run/my_job.lock"`), it is created at that specific path. The parent directories will be created automatically if they do not exist.
 - `block` (bool):
   - `False` (default): Exit immediately if the lock cannot be acquired.

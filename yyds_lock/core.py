@@ -33,7 +33,8 @@ def _resolve_lock_path(lock_name: str) -> str:
     if os.path.isabs(lock_name) or "/" in lock_name or "\\" in lock_name:
         path = os.path.abspath(lock_name)
     else:
-        path = os.path.abspath(os.path.join(os.path.expanduser("~"), lock_name))
+        base_dir = os.path.join(os.path.expanduser("~"), ".yyds_lock")
+        path = os.path.abspath(os.path.join(base_dir, lock_name))
     return os.path.realpath(path)
 
 def _get_path_lock(lock_path: str) -> threading.Lock:

@@ -80,7 +80,7 @@ except AlreadyLockedError:
 `force_single` 和 `single_decorator` 均接受以下参数：
 
 - `lock_name` (str)：锁文件的名称或路径。
-  - 如果仅传入文件名（如 `"my_job.lock"`），锁文件会自动创建在用户家目录（`~`）下。
+  - 如果仅传入文件名（如 `"my_job.lock"`），锁文件会自动创建在用户家目录的隐藏文件夹 `~/.yyds_lock` 下（如果不存在会自动创建）。
   - 如果传入的是相对路径或绝对路径（如 `"/var/run/my_job.lock"`），则会在对应路径创建。如果父级目录不存在，会自动创建。
 - `block` (bool)：
   - `False`（默认值）：非阻塞模式。如果发现锁已被占用，立即引发冲突处理。

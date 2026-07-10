@@ -10,6 +10,7 @@ import subprocess
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from yyds_lock import force_single, release_single, single_decorator, AlreadyLockedError
+from yyds_lock.core import _resolve_lock_path
 
 
 class TestYYDSLock(unittest.TestCase):
@@ -17,7 +18,7 @@ class TestYYDSLock(unittest.TestCase):
     def setUp(self):
         # Cleanup test locks in home directory if any exist
         self.test_lock_name = "yyds_test_instance.lock"
-        self.lock_path = os.path.join(os.path.expanduser("~"), self.test_lock_name)
+        self.lock_path = _resolve_lock_path(self.test_lock_name)
         if os.path.exists(self.lock_path):
             try:
                 os.remove(self.lock_path)
