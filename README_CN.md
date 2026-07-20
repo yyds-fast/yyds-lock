@@ -5,16 +5,16 @@
 
 [English](README.md)
 
-`yyds-lock` 是一个**工业级**、极轻量级、**零依赖（Zero-dependency）** 的 Python 进程与线程单例锁工具库。它通过操作系统底层的建议性文件锁（Advisory File Lock）来保证同一时间只有一个脚本实例/进程/线程处于运行状态。非常适合定时任务（Crontab）、自动化脚本、抢票爬虫、后台守护服务以及多线程任务排队。
+`yyds-lock` 是一个轻量级、零运行时依赖的 Python 单实例锁工具库。它通过操作系统建议性文件锁（Advisory File Lock），协调使用同一路径的脚本、进程、线程和 asyncio Task，适合定时任务（Crontab）、自动化脚本、调度器以及单机后台服务。
 
 ## 核心特性
 
 - 🛡️ **防崩溃死锁（Immunity to Crashes）**：不同于传统的 PID 文件或创建临时文件（如 `lock.txt`）的方案，如果脚本遇到 `kill -9` 强杀、机房突然断电或代码崩溃，残留的文件会导致下次启动永久死锁。`yyds-lock` 锁是绑定在操作系统的文件描述符及进程上的，当进程结束的瞬间，操作系统会自动释放该锁，**绝无僵尸死锁隐患**。
-- 🪶 **零第三方依赖（Zero Dependencies）**：100% 纯 Python 标准库实现。打包后大小不到 5KB，对系统和运行环境零污染。
+- 🪶 **零第三方依赖（Zero Dependencies）**：100% Python 标准库实现，不安装任何运行时依赖包。
 - 🎛️ **双模式切换（Dual Modes）**：既支持发现重复进程后“优雅秒退”模式（非阻塞，打印红色错误并以退出码 `1` 退出），也支持“排队等候”模式（阻塞等待前一个实例运行结束）。
-- 🧵 **线程安全与隔离**：原生支持多线程环境。同一进程内的不同线程可以被正确互斥隔离，分别排队或触发冲突退出，重入逻辑仅针对同一线程生效。
-- 🔱 **进程派生安全（Fork-Safety）**：自动兼容 Unix 上的进程 fork 机制（如 `multiprocessing`、Celery、Gunicorn 等），防止子进程继承父进程句柄导致的文件锁泄漏及父进程被意外解锁。
-- 📁 **只读目录自动降级**：如果用户家目录不可写或不存在（例如 headless Docker 容器中），库会自动、安全地降级到系统临时目录。
+- 🧵 **线程与任务隔离**：同一进程内的不同线程或 asyncio Task 可以正确互斥，分别等待或触发冲突；重入仅对同一个仍存活的执行所有者生效。
+- 🔱 **进程派生安全（Fork-Safety）**：在 Unix `fork()` 前同步注册表变更；子进程关闭已获取及获取中的继承句柄，并重建线程同步对象，不会解锁父进程。
+- 📁 **只读目录自动降级**：家目录不可写或不存在时，裸文件名会降级到系统临时目录下的当前用户私有目录；显式 `base_dir` 失败时不会静默换路径。
 - 🧹 **自动资源清理**：注册 `atexit` 清理钩子，在 Python 解释器正常退出时自动关闭所有打开的文件锁句柄，彻底消除 `ResourceWarning` 警告。
 - 💻 **跨平台兼容**：在 Windows 上使用 `msvcrt.locking`，在 Linux 和 macOS 上使用 `fcntl.flock`。
 
@@ -84,6 +84,21 @@ except AlreadyLockedError:
     # 在这里添加自定义的降级/备份逻辑
 ```
 
+权限错误、文件系统不支持锁等运行故障会抛出 `LockOperationError`，不会再伪装成锁竞争。
+
+### 姿势 D：上下文管理器
+
+需要明确控制锁的代码作用域时，可以使用 `SingleInstanceLock`：
+
+```python
+from yyds_lock import SingleInstanceLock
+
+with SingleInstanceLock("my_task.lock", raise_on_conflict=True):
+    run_task()
+```
+
+装饰器也会在 coroutine、generator 和 async generator 的完整执行周期内持锁。同步等待会阻塞事件循环，因此 asyncio Task 内明确拒绝 `block=True`；如确需阻塞获取，请放到 executor 中运行。
+
 ---
 
 ## 配置参数说明
@@ -99,7 +114,7 @@ except AlreadyLockedError:
 - `raise_on_conflict` (bool)：
   - `False`（默认值）：锁被占用时，直接向日志系统或 stderr 输出错误并以退出码 `1` 退出进程。
   - `True`：锁被占用时，抛出 `AlreadyLockedError` 异常，允许调用者捕获并进行自定义处理。
-- `base_dir` (str, 可选)：手动指定锁文件存放的目录，用于覆盖默认的 `~/.yyds_lock`。
+- `base_dir` (str 或 `os.PathLike`, 可选)：覆盖裸文件名默认使用的 `~/.yyds_lock`。显式目录不可用时抛出 `LockOperationError`，不会静默降级。
 
 ---
 
@@ -110,18 +125,25 @@ except AlreadyLockedError:
 import logging
 logger = logging.getLogger("yyds_lock")
 ```
-如果您的项目未配置任何 Log Handler，为了保证轻量化脚本的易用性，本库会自动向 `sys.stderr` 打印彩色的控制台警告信息。
+配置了有效 Handler 时，冲突只通过日志输出一次；没有 Handler 时，只向 `sys.stderr` 输出一次，并且仅在终端环境使用颜色。
 
 ---
 
 ## 技术原理
 
 1. **Linux / macOS**：底层调用 `fcntl.flock(fd, fcntl.LOCK_EX)` 对打开的文件加上排他性锁定。
-2. **Windows**：底层调用 `msvcrt.locking(fd, msvcrt.LK_LOCK, 1)` 对文件的首字节加锁。
-3. **线程级排他与防死锁**：在内存中使用基于 `threading.get_ident()` 线程 ID 的全局注册表来跟踪重入状态。操作系统级别的文件锁获取与释放逻辑均在 Python 级别全局互斥锁之外运行，彻底避免了并发排队时的多线程死锁。
-4. **派生安全 (Fork-Safety)**：在 Unix 平台上通过 `os.register_at_fork` 注册钩子，子进程启动后自动关闭继承的锁文件描述符而不触发 `LOCK_UN`，防止影响父进程的锁定状态。
+2. **Windows**：通过可中断轮询 `msvcrt.LK_NBLCK` 锁定首字节，使 `block=True` 真正等待到锁可用，不受 CRT 固定重试次数限制。
+3. **线程与任务隔离**：以仍存活的 `Thread` 或 asyncio `Task` 对象作为所有者，支持同一所有者重入，并在调用 OS 锁前串行化进程内的同路径状态迁移。
+4. **派生安全 (Fork-Safety)**：使用 `os.register_at_fork` 的三个阶段；fork gate 同步注册表变更，子进程关闭已获取及获取中的句柄后重建同步对象。
 5. **垃圾回收与自动清理**：在内存中保持对文件句柄的引用以防止 Python GC 提早关闭文件。以下情况会释放文件锁：
    - 显式调用 `release_single`。
    - 装饰器函数执行结束。
    - 解释器退出阶段的 `atexit` 清理钩子被调用。
    - 进程退出/被杀死/断电关机，操作系统内核自动回收进程占用的所有文件描述符，此时文件锁将被**瞬间强行释放**。
+
+## 适用边界
+
+- 文件锁是建议性的，所有参与者必须使用同一规范化路径并主动配合加锁。
+- 互斥范围仅覆盖共享同一底层文件系统的进程。不同主机、文件系统隔离的容器或各自的临时目录需要分布式锁。
+- 网络文件系统对 `flock` 的实现可能不同，关键任务上线前应验证实际挂载环境。
+- `sys.exit(1)` 本质是在调用上下文抛出 `SystemExit`；在库代码和工作线程中通常更适合设置 `raise_on_conflict=True`。

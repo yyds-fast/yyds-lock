@@ -10,7 +10,13 @@ import threading
 # Add the parent directory to Python path to import yyds_lock
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from yyds_lock import force_single, release_single, single_decorator, AlreadyLockedError
+from yyds_lock import (
+    AlreadyLockedError,
+    SingleInstanceLock,
+    force_single,
+    release_single,
+    single_decorator,
+)
 from yyds_lock.core import _resolve_lock_path
 
 
@@ -302,7 +308,10 @@ class TestYYDSLock(unittest.TestCase):
             with open(target_file, "w") as f:
                 f.write("")
                 
-            os.symlink(target_file, symlink_file)
+            try:
+                os.symlink(target_file, symlink_file)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest("Symbolic links are unavailable: {}".format(exc))
             
             # Now, acquiring target_file should be reentrant with acquiring symlink_file
             try:
@@ -423,10 +432,15 @@ class TestYYDSLock(unittest.TestCase):
         t2.join()
 
     def test_fork_safety(self):
-        if not hasattr(os, "register_at_fork"):
-            self.skipTest("os.register_at_fork is not supported on this platform")
-            
         import multiprocessing
+
+        if (
+            not hasattr(os, "register_at_fork")
+            or "fork" not in multiprocessing.get_all_start_methods()
+        ):
+            self.skipTest("fork start method is not supported on this platform")
+
+        context = multiprocessing.get_context("fork")
         lock_name = "fork_safety_test.lock"
         
         force_single(lock_name, block=False)
@@ -444,17 +458,340 @@ class TestYYDSLock(unittest.TestCase):
             conn.send((registry_empty, child_can_acquire))
             conn.close()
             
-        parent_conn, child_conn = multiprocessing.Pipe()
-        p = multiprocessing.Process(target=child_process, args=(child_conn,))
+        parent_conn, child_conn = context.Pipe()
+        p = context.Process(target=child_process, args=(child_conn,))
         p.start()
-        
-        registry_empty, child_can_acquire = parent_conn.recv()
-        p.join()
-        
-        release_single(lock_name)
-        
+
+        try:
+            self.assertTrue(parent_conn.poll(3), "forked child did not respond")
+            registry_empty, child_can_acquire = parent_conn.recv()
+            p.join(timeout=3)
+            self.assertFalse(p.is_alive(), "forked child did not exit")
+        finally:
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=2)
+            parent_conn.close()
+            child_conn.close()
+            release_single(lock_name)
+
         self.assertTrue(registry_empty)
         self.assertFalse(child_can_acquire)
+
+    def test_fork_does_not_deadlock_on_inherited_registry_lock(self):
+        if not hasattr(os, "fork"):
+            self.skipTest("os.fork is not supported on this platform")
+
+        code = r'''
+import os
+import signal
+import threading
+import time
+from yyds_lock import core
+
+locked = threading.Event()
+
+def holder():
+    core._registry_lock.acquire()
+    locked.set()
+    time.sleep(0.3)
+    core._registry_lock.release()
+
+thread = threading.Thread(target=holder)
+thread.start()
+locked.wait()
+pid = os.fork()
+if pid == 0:
+    os._exit(0)
+
+thread.join()
+deadline = time.monotonic() + 2
+while time.monotonic() < deadline:
+    completed, _ = os.waitpid(pid, os.WNOHANG)
+    if completed:
+        raise SystemExit(0)
+    time.sleep(0.02)
+
+os.kill(pid, signal.SIGKILL)
+os.waitpid(pid, 0)
+raise SystemExit(2)
+'''
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fork_closes_in_flight_handles_in_child(self):
+        if not hasattr(os, "fork"):
+            self.skipTest("os.fork is not supported on this platform")
+
+        code = r'''
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from yyds_lock import AlreadyLockedError, force_single, release_single
+from yyds_lock import core
+
+with tempfile.TemporaryDirectory() as directory:
+    path = os.path.join(directory, "pending.lock")
+    holder_code = (
+        "import sys; from yyds_lock import force_single; "
+        "force_single(sys.argv[1], raise_on_conflict=True); "
+        "print('LOCKED', flush=True); sys.stdin.readline()"
+    )
+    holder = subprocess.Popen(
+        [sys.executable, "-c", holder_code, path],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if holder.stdout.readline().strip() != "LOCKED":
+        raise SystemExit(10)
+
+    acquired = threading.Event()
+    def waiter():
+        force_single(path, block=True, raise_on_conflict=True)
+        acquired.set()
+        release_single(path)
+
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        with core._registry_guard():
+            if core._pending_handles:
+                break
+        time.sleep(0.01)
+    else:
+        raise SystemExit(11)
+
+    pid = os.fork()
+    if pid == 0:
+        clean = not core._pending_handles and not core._lock_file_handles
+        try:
+            force_single(path, block=False, raise_on_conflict=True)
+            conflicted = False
+        except AlreadyLockedError:
+            conflicted = True
+        os._exit(0 if clean and conflicted else 12)
+
+    _, child_status = os.waitpid(pid, 0)
+    holder.stdin.write("release\n")
+    holder.stdin.flush()
+    holder.wait(timeout=2)
+    thread.join(timeout=2)
+    child_exit = os.waitstatus_to_exitcode(child_status)
+    clean_parent = (
+        acquired.is_set()
+        and not thread.is_alive()
+        and not core._pending_handles
+        and not core._lock_file_handles
+    )
+    raise SystemExit(0 if child_exit == 0 and clean_parent else 13)
+'''
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+            capture_output=True,
+            text=True,
+            timeout=7,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_default_conflict_message_is_emitted_once(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stderr
+        from unittest.mock import patch
+        from yyds_lock import core
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "single-message.lock")
+            force_single(lock_path, raise_on_conflict=True)
+            errors = []
+            stderr = io.StringIO()
+
+            def contender():
+                try:
+                    force_single(lock_path, block=False)
+                except SystemExit as exc:
+                    errors.append(exc.code)
+
+            with patch.object(core.logger, "hasHandlers", return_value=False):
+                with redirect_stderr(stderr):
+                    thread = threading.Thread(target=contender)
+                    thread.start()
+                    thread.join()
+
+            release_single(lock_path)
+
+        self.assertEqual(errors, [1])
+        self.assertEqual(stderr.getvalue().count("[yyds-lock] 错误"), 1)
+        self.assertNotIn("\033", stderr.getvalue())
+
+    def test_non_conflict_os_error_is_not_reported_as_locked(self):
+        import errno
+        import tempfile
+        from unittest.mock import patch
+        from yyds_lock import LockOperationError
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "io-error.lock")
+            with patch(
+                "yyds_lock.core._acquire_os_lock",
+                side_effect=OSError(errno.EIO, "I/O failure"),
+            ):
+                with self.assertRaises(LockOperationError):
+                    force_single(lock_path, block=False, raise_on_conflict=True)
+
+    def test_release_uses_path_recorded_at_acquisition(self):
+        import tempfile
+        from unittest.mock import patch
+        from yyds_lock import core
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "stable-release.lock")
+            with patch.object(core, "_resolve_lock_path", return_value=lock_path) as resolver:
+                force_single("logical-name.lock", raise_on_conflict=True)
+                release_single("logical-name.lock")
+
+            self.assertEqual(resolver.call_count, 1)
+            self.assertNotIn(lock_path, core._lock_file_handles)
+
+    def test_async_decorator_holds_lock_across_await(self):
+        import asyncio
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "async.lock")
+
+            async def scenario():
+                entered = asyncio.Event()
+                finish = asyncio.Event()
+
+                @single_decorator(
+                    lock_name=lock_path,
+                    block=False,
+                    raise_on_conflict=True,
+                )
+                async def protected():
+                    entered.set()
+                    await finish.wait()
+                    return "done"
+
+                task = asyncio.create_task(protected())
+                await entered.wait()
+                with self.assertRaises(AlreadyLockedError):
+                    force_single(lock_path, block=False, raise_on_conflict=True)
+                finish.set()
+                self.assertEqual(await task, "done")
+
+            asyncio.run(scenario())
+
+    def test_async_blocking_decorator_is_rejected(self):
+        with self.assertRaises(ValueError):
+            @single_decorator(lock_name="async-block.lock", block=True)
+            async def protected():
+                pass
+
+    def test_direct_async_blocking_call_is_rejected(self):
+        import asyncio
+
+        async def scenario():
+            with self.assertRaises(ValueError):
+                force_single("async-direct-block.lock", block=True)
+
+        asyncio.run(scenario())
+
+    def test_generator_decorator_holds_lock_until_closed(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "generator.lock")
+
+            @single_decorator(
+                lock_name=lock_path,
+                block=False,
+                raise_on_conflict=True,
+            )
+            def protected_generator():
+                yield "first"
+                yield "second"
+
+            generator = protected_generator()
+            self.assertEqual(next(generator), "first")
+
+            errors = []
+
+            def contender():
+                try:
+                    force_single(lock_path, block=False, raise_on_conflict=True)
+                except AlreadyLockedError as exc:
+                    errors.append(exc)
+
+            thread = threading.Thread(target=contender)
+            thread.start()
+            thread.join()
+            self.assertEqual(len(errors), 1)
+
+            generator.close()
+            force_single(lock_path, block=False, raise_on_conflict=True)
+            release_single(lock_path)
+
+    def test_context_manager_releases_after_exception(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "context.lock")
+            lock = SingleInstanceLock(lock_path, raise_on_conflict=True)
+
+            with self.assertRaisesRegex(RuntimeError, "business failure"):
+                with lock:
+                    self.assertTrue(lock.acquired)
+                    raise RuntimeError("business failure")
+
+            self.assertFalse(lock.acquired)
+            force_single(lock_path, raise_on_conflict=True)
+            release_single(lock_path)
+
+    def test_windows_block_mode_retries_nonblocking_lock(self):
+        import errno
+        import tempfile
+        import types
+        from unittest.mock import patch
+        from yyds_lock import core
+
+        calls = []
+        fake_msvcrt = types.SimpleNamespace(
+            LK_NBLCK=1,
+            LK_UNLCK=2,
+        )
+
+        def locking(fd, mode, size):
+            calls.append((mode, size))
+            if mode == fake_msvcrt.LK_NBLCK and len(calls) < 3:
+                raise OSError(errno.EACCES, "locked")
+
+        fake_msvcrt.locking = locking
+
+        with tempfile.TemporaryFile(mode="w+b") as handle:
+            with patch.object(core.os, "name", "nt"):
+                with patch.dict(sys.modules, {"msvcrt": fake_msvcrt}):
+                    with patch.object(core.time, "sleep") as sleeper:
+                        core._acquire_os_lock(handle, block=True)
+
+            self.assertEqual(calls, [(1, 1), (1, 1), (1, 1)])
+            self.assertEqual(sleeper.call_count, 2)
+            handle.seek(0, os.SEEK_END)
+            self.assertEqual(handle.tell(), 1)
 
 
 if __name__ == "__main__":

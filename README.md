@@ -5,16 +5,16 @@
 
 [中文文档](README_CN.md)
 
-`yyds-lock` is an industrial-grade, ultra-lightweight, zero-dependency Python library that guarantees single-instance execution of scripts, processes, or threads using operating system level advisory file locks. It is ideal for cron jobs, automation scripts, schedulers, and background daemons.
+`yyds-lock` is a lightweight, zero-dependency Python library for single-instance execution of cooperating scripts, processes, threads, and asyncio tasks using operating-system advisory file locks. It is designed for cron jobs, automation scripts, schedulers, and local background daemons.
 
 ## Key Features
 
 - 🛡️ **Immunity to Crashes / Force Kills**: Unlike PID files or stale lock files that cause permanent lockups if a process is terminated forcefully (`kill -9`, crash, or power loss), `yyds-lock` binds the lock to the process file descriptor. The OS automatically and instantly releases the lock as soon as the process ends.
-- 🪶 **Zero Dependencies**: 100% pure Python standard library. Package size is less than 5KB and does not pollute your runtime environment.
+- 🪶 **Zero Dependencies**: 100% Python standard library with no runtime packages to install.
 - 🎛️ **Dual Modes**: Supports both "Instant Exit" (non-blocking, terminates immediately if another instance is running) and "Queue / Wait" (blocking, waits for the existing instance to finish).
 - 🧵 **Thread-Safety & Isolation**: Safe to use in multi-threaded programs. Different threads running under the same process are isolated and will block or raise conflicts on the same lock.
-- 🔱 **Fork-Safety**: Automatically handles Unix process forks (`multiprocessing`, Celery, Gunicorn, etc.) by closing inherited locks in child processes without unlocking the parent.
-- 📁 **Inaccessible Directory Fallback**: If the home directory is read-only or does not exist (e.g., in headless Docker containers), the library automatically and safely falls back to the system temporary directory.
+- 🔱 **Fork-Safety**: Coordinates registry mutations with Unix `fork()` and closes both acquired and in-flight inherited descriptors in the child without unlocking the parent.
+- 📁 **Inaccessible Directory Fallback**: If the home directory is read-only or unavailable, bare lock names fall back to a private per-user directory under the system temporary directory. An explicit `base_dir` never silently moves.
 - 🧹 **Automatic Cleanup**: Registers an `atexit` cleanup hook to close file descriptors cleanly on interpreter shutdown, preventing python `ResourceWarning`.
 - 💻 **Cross-Platform**: Seamlessly works on Linux, macOS (using `fcntl.flock`), and Windows (using `msvcrt.locking`).
 
@@ -84,6 +84,21 @@ except AlreadyLockedError:
     # Add custom fallback actions here
 ```
 
+Operational failures such as permission errors or unsupported filesystem locking raise `LockOperationError` rather than being misreported as lock contention.
+
+### Pattern D: Context Manager
+
+Use `SingleInstanceLock` when the lock should have an explicit lexical lifetime:
+
+```python
+from yyds_lock import SingleInstanceLock
+
+with SingleInstanceLock("my_task.lock", raise_on_conflict=True):
+    run_task()
+```
+
+The decorator also preserves the lock for the full lifetime of coroutine, generator, and async-generator functions. Because synchronous file-lock waiting would stop the event loop, `block=True` is rejected inside asyncio tasks; run blocking acquisition in an executor when needed.
+
 ---
 
 ## Configuration / Arguments
@@ -99,7 +114,7 @@ Both `force_single` and `single_decorator` accept the following arguments:
 - `raise_on_conflict` (bool):
   - `False` (default): Immediately log an error and call `sys.exit(1)` when the lock is already held.
   - `True`: Raise `AlreadyLockedError` when the lock is already held, allowing the caller to catch it.
-- `base_dir` (str, optional): Overrides the default folder directory (`~/.yyds_lock`) where simple filenames are saved.
+- `base_dir` (str or `os.PathLike`, optional): Overrides the default folder (`~/.yyds_lock`) for simple filenames. Failure to use an explicit directory raises `LockOperationError`; it is not silently replaced.
 
 ---
 
@@ -110,18 +125,25 @@ Both `force_single` and `single_decorator` accept the following arguments:
 import logging
 logger = logging.getLogger("yyds_lock")
 ```
-By default, if you have not configured any handlers for your logging system, `yyds-lock` will automatically print user-friendly colored error messages to `sys.stderr` to maintain simplicity for basic scripts.
+If an effective handler is configured, conflicts are emitted once through logging. Otherwise, `yyds-lock` prints one message to `sys.stderr` (colored only when stderr is a terminal).
 
 ---
 
 ## How It Works Under the Hood
 
 1. **Linux / macOS**: Uses `fcntl.flock(fd, fcntl.LOCK_EX)` for exclusive advisory locking.
-2. **Windows**: Uses `msvcrt.locking(fd, msvcrt.LK_LOCK, 1)` to lock the first byte of the file.
-3. **Thread Safety**: Uses a thread-safe global registry with reentrancy checks mapped to `threading.get_ident()`. File descriptor locking calls are executed outside the global lock, preventing deadlocks when threads block and wait.
-4. **Fork-Safety**: Automatically tracks forks and closes open descriptors in child processes post-fork (via `os.register_at_fork`).
+2. **Windows**: Uses interruptible polling around `msvcrt.LK_NBLCK` to lock the first byte, giving `block=True` true wait-until-available behavior instead of the CRT's bounded retry window.
+3. **Thread / Task Safety**: Tracks the owning live `Thread` or asyncio `Task` object, supports same-owner reentrancy, and serializes local path transitions before calling the OS lock.
+4. **Fork-Safety**: Uses all three `os.register_at_fork` phases. A fork gate snapshots registry mutations, and the child replaces inherited synchronization primitives after closing acquired and in-flight descriptors.
 5. **Clean Reclamation**: Locks are released when:
    - An explicit `release_single` call is executed.
    - The decorated function finishes execution.
    - Python exit handlers run (`atexit`).
    - The process terminates or is killed, prompting the operating system to reclaim all file descriptors and release the locks.
+
+## Scope and Limitations
+
+- Locks are advisory: every participant must cooperate by locking the same canonical file path.
+- Mutual exclusion is local to processes that share the same underlying filesystem. Separate containers, hosts, or non-shared temporary directories require a distributed lock instead.
+- Network filesystems may implement `flock` differently; validate the target filesystem before relying on it for critical coordination.
+- `sys.exit(1)` raises `SystemExit` in the calling execution context. In libraries and worker threads, `raise_on_conflict=True` is usually the safer integration mode.
