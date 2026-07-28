@@ -121,32 +121,40 @@ class TestYYDSLock(unittest.TestCase):
             text=True,
         )
 
-        # Wait for background process to output "LOCKED"
-        output = proc_hold.stdout.readline().strip()
-        self.assertEqual(output, "LOCKED")
+        try:
+            # Wait for background process to output "LOCKED"
+            output = proc_hold.stdout.readline().strip()
+            self.assertEqual(output, "LOCKED")
 
-        # Now try to acquire the same lock in a second process with block=False
-        code_try = (
-            "import sys, os\n"
-            "sys.path.insert(0, os.path.abspath('.'))\n"
-            f"from yyds_lock import force_single\n"
-            f"force_single('{self.test_lock_name}', block=False)\n"
-            "print('ACQUIRED', flush=True)\n"
-        )
+            # Try to acquire the same lock in a second non-blocking process.
+            code_try = (
+                "import sys, os\n"
+                "sys.path.insert(0, os.path.abspath('.'))\n"
+                f"from yyds_lock import force_single\n"
+                f"force_single('{self.test_lock_name}', block=False)\n"
+                "print('ACQUIRED', flush=True)\n"
+            )
+            proc_try = subprocess.run(
+                [sys.executable, "-c", code_try],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
 
-        proc_try = subprocess.run(
-            [sys.executable, "-c", code_try], capture_output=True, text=True
-        )
-
-        # The second process must exit with code 1 (since it is already locked)
-        self.assertEqual(proc_try.returncode, 1)
-        self.assertIn("[yyds-lock] 错误: 脚本进程已在运行中", proc_try.stderr)
-        self.assertNotIn("ACQUIRED", proc_try.stdout)
-
-        # Cleanup
-        proc_hold.stdout.close()
-        proc_hold.stderr.close()
-        proc_hold.wait()
+            self.assertEqual(proc_try.returncode, 1)
+            # A non-UTF-8 Windows pipe may backslash-escape the Chinese text.
+            self.assertIn("[yyds-lock]", proc_try.stderr)
+            self.assertNotIn("ACQUIRED", proc_try.stdout)
+        finally:
+            if proc_hold.poll() is None:
+                proc_hold.terminate()
+            try:
+                proc_hold.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc_hold.kill()
+                proc_hold.wait(timeout=3)
+            proc_hold.stdout.close()
+            proc_hold.stderr.close()
 
     def test_subprocess_blocking_wait(self):
         # Start a background process that holds the lock for 1.5 seconds
@@ -335,20 +343,13 @@ class TestYYDSLock(unittest.TestCase):
 
     def test_path_resolution_fallback(self):
         from unittest.mock import patch
+        from yyds_lock import core
 
-        original_access = os.access
-
-        def mock_access(path, mode):
-            if ".yyds_lock" in path or "home" in path or "~" in path:
-                return False
-            return original_access(path, mode)
-
-        with patch("os.access", side_effect=mock_access):
+        with patch.object(core.os, "access", return_value=False):
             resolved = _resolve_lock_path("test_fallback.lock")
-            import tempfile
 
-            temp_dir = tempfile.gettempdir()
-            self.assertTrue(resolved.startswith(os.path.realpath(temp_dir)))
+        expected_dir = os.path.realpath(core._temp_lock_dir())
+        self.assertEqual(os.path.dirname(resolved), expected_dir)
 
     def test_private_directory_permissions_are_hardened(self):
         import stat
@@ -650,14 +651,16 @@ with tempfile.TemporaryDirectory() as directory:
     holder.stdin.flush()
     holder.wait(timeout=2)
     thread.join(timeout=2)
-    child_exit = os.waitstatus_to_exitcode(child_status)
+    child_exited_cleanly = (
+        os.WIFEXITED(child_status) and os.WEXITSTATUS(child_status) == 0
+    )
     clean_parent = (
         acquired.is_set()
         and not thread.is_alive()
         and not core._pending_handles
         and not core._lock_file_handles
     )
-    raise SystemExit(0 if child_exit == 0 and clean_parent else 13)
+    raise SystemExit(0 if child_exited_cleanly and clean_parent else 13)
 """
         result = subprocess.run(
             [sys.executable, "-c", code],
