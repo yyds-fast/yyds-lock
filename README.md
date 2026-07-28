@@ -13,6 +13,7 @@
 - 🪶 **Zero Dependencies**: 100% Python standard library with no runtime packages to install.
 - 🎛️ **Dual Modes**: Supports both "Instant Exit" (non-blocking, terminates immediately if another instance is running) and "Queue / Wait" (blocking, waits for the existing instance to finish).
 - 🧵 **Thread-Safety & Isolation**: Safe to use in multi-threaded programs. Different threads running under the same process are isolated and will block or raise conflicts on the same lock.
+- ⚡ **Async-Safe Waiting**: `force_single_async` and asynchronous decorators wait without blocking the event loop and support finite timeouts.
 - 🔱 **Fork-Safety**: Coordinates registry mutations with Unix `fork()` and closes both acquired and in-flight inherited descriptors in the child without unlocking the parent.
 - 📁 **Inaccessible Directory Fallback**: If the home directory is read-only or unavailable, bare lock names fall back to a private per-user directory under the system temporary directory. An explicit `base_dir` never silently moves.
 - 🧹 **Automatic Cleanup**: Registers an `atexit` cleanup hook to close file descriptors cleanly on interpreter shutdown, preventing python `ResourceWarning`.
@@ -97,15 +98,36 @@ with SingleInstanceLock("my_task.lock", raise_on_conflict=True):
     run_task()
 ```
 
-The decorator also preserves the lock for the full lifetime of coroutine, generator, and async-generator functions. Because synchronous file-lock waiting would stop the event loop, `block=True` is rejected inside asyncio tasks; run blocking acquisition in an executor when needed.
+The decorator also preserves the lock for the full lifetime of coroutine, generator, and async-generator functions. Asynchronous decorators safely support `block=True` without blocking the event loop.
+
+### Pattern E: Async Waiting with a Timeout
+
+Use `force_single_async` directly from the Task that will eventually release the lock:
+
+```python
+from yyds_lock import LockTimeoutError, force_single_async, release_single
+
+async def run_job():
+    try:
+        await force_single_async("my_async_job.lock", timeout=10)
+    except LockTimeoutError:
+        return
+
+    try:
+        await do_work()
+    finally:
+        release_single("my_async_job.lock")
+```
+
+Do not acquire in an executor and release from the event-loop Task: lock ownership belongs to the Thread or Task that performed the acquisition. If an executor is required, the complete acquire/work/release scope must run in one executor call.
 
 ---
 
 ## Configuration / Arguments
 
-Both `force_single` and `single_decorator` accept the following arguments:
+`force_single` and `single_decorator` share the following core arguments:
 
-- `lock_name` (str or callable): The filename/path of the lock, or a callable returning a string when using the decorator.
+- `lock_name` (str or `os.PathLike`): The filename/path of the lock. `single_decorator` additionally accepts a callable that returns the lock name from the decorated function's arguments.
   - If a simple filename is given (e.g. `"my_job.lock"`), it is automatically created in a hidden directory `.yyds_lock` under the user's home directory (`~/.yyds_lock`).
   - If an absolute or relative path is given (e.g., `"/var/run/my_job.lock"`), it is created at that specific path. The parent directories will be created automatically if they do not exist.
 - `block` (bool):
@@ -115,6 +137,13 @@ Both `force_single` and `single_decorator` accept the following arguments:
   - `False` (default): Immediately log an error and call `sys.exit(1)` when the lock is already held.
   - `True`: Raise `AlreadyLockedError` when the lock is already held, allowing the caller to catch it.
 - `base_dir` (str or `os.PathLike`, optional): Overrides the default folder (`~/.yyds_lock`) for simple filenames. Failure to use an explicit directory raises `LockOperationError`; it is not silently replaced.
+
+`force_single_async` accepts `lock_name` and `base_dir` plus:
+
+- `timeout` (float or `None`): Maximum wait in seconds. `None` waits indefinitely; expiration raises `LockTimeoutError`.
+- `poll_interval` (float): Delay between non-blocking attempts, defaulting to `0.05` seconds.
+
+For coroutine and async-generator decorators, `timeout` and `poll_interval` configure async waiting when `block=True`.
 
 ---
 

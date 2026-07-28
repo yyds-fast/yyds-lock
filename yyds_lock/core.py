@@ -7,6 +7,7 @@ import getpass
 import hashlib
 import inspect
 import logging
+import math
 import os
 import stat
 import sys
@@ -26,6 +27,10 @@ class YYDSLockError(Exception):
 
 class AlreadyLockedError(YYDSLockError):
     """Raised when a lock cannot be acquired because it is already held."""
+
+
+class LockTimeoutError(AlreadyLockedError):
+    """Raised when an asynchronous lock wait exceeds its timeout."""
 
 
 class LockOperationError(YYDSLockError):
@@ -80,9 +85,7 @@ def _coerce_path(value, parameter):
 
 def _is_bare_lock_name(lock_name):
     return (
-        not os.path.isabs(lock_name)
-        and "/" not in lock_name
-        and "\\" not in lock_name
+        not os.path.isabs(lock_name) and "/" not in lock_name and "\\" not in lock_name
     )
 
 
@@ -103,20 +106,28 @@ def _prepare_directory(directory):
     os.makedirs(directory, mode=0o700, exist_ok=True)
 
 
-def _prepare_temp_directory():
-    directory = _temp_lock_dir()
+def _prepare_private_directory(directory):
+    """Create and validate a library-owned per-user lock directory."""
     _prepare_directory(directory)
     if os.name != "nt" and hasattr(os, "getuid"):
         directory_stat = os.lstat(directory)
-        if not stat.S_ISDIR(directory_stat.st_mode) or directory_stat.st_uid != os.getuid():
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or directory_stat.st_uid != os.getuid()
+        ):
             raise PermissionError(
                 errno.EACCES,
-                "temporary lock directory is not owned by the current user",
+                "lock directory is not owned by the current user",
                 directory,
             )
         if stat.S_IMODE(directory_stat.st_mode) & 0o077:
             os.chmod(directory, 0o700)
     return directory
+
+
+def _prepare_temp_directory():
+    directory = _temp_lock_dir()
+    return _prepare_private_directory(directory)
 
 
 def _resolve_lock_path(lock_name: str, base_dir: str = None) -> str:
@@ -140,17 +151,16 @@ def _resolve_lock_path(lock_name: str, base_dir: str = None) -> str:
     else:
         home = os.path.expanduser("~")
         home_is_usable = bool(
-            home
-            and home != "~"
-            and os.path.isdir(home)
-            and os.access(home, os.W_OK)
+            home and home != "~" and os.path.isdir(home) and os.access(home, os.W_OK)
         )
-        target_dir = os.path.join(home, ".yyds_lock") if home_is_usable else _temp_lock_dir()
+        target_dir = (
+            os.path.join(home, ".yyds_lock") if home_is_usable else _temp_lock_dir()
+        )
         try:
             if target_dir == _temp_lock_dir():
                 _prepare_temp_directory()
             else:
-                _prepare_directory(target_dir)
+                _prepare_private_directory(target_dir)
         except OSError:
             target_dir = _prepare_temp_directory()
 
@@ -159,10 +169,12 @@ def _resolve_lock_path(lock_name: str, base_dir: str = None) -> str:
 
 def _logical_lock_key(lock_name, base_dir):
     lock_name = _coerce_path(lock_name, "lock_name")
-    normalized_base = None
+    logical_base = None
     if base_dir is not None:
-        normalized_base = os.path.abspath(_coerce_path(base_dir, "base_dir"))
-    return lock_name, normalized_base
+        # Keep the caller's spelling stable across chdir().  The canonical
+        # resolved path still provides alias detection in _claim_local_path.
+        logical_base = _coerce_path(base_dir, "base_dir")
+    return lock_name, logical_base
 
 
 def _current_owner():
@@ -263,6 +275,30 @@ def _operation_error(action, lock_path, error):
     return LockOperationError(
         "Unable to {} lock '{}': {}".format(action, lock_path, error)
     )
+
+
+def _validate_async_wait_options(timeout, poll_interval):
+    if timeout is not None:
+        if isinstance(timeout, bool):
+            raise TypeError("timeout must be a non-negative finite number or None")
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "timeout must be a non-negative finite number or None"
+            ) from exc
+        if timeout < 0 or not math.isfinite(timeout):
+            raise ValueError("timeout must be a non-negative finite number or None")
+
+    if isinstance(poll_interval, bool):
+        raise TypeError("poll_interval must be a positive finite number")
+    try:
+        poll_interval = float(poll_interval)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("poll_interval must be a positive finite number") from exc
+    if poll_interval <= 0 or not math.isfinite(poll_interval):
+        raise ValueError("poll_interval must be a positive finite number")
+    return timeout, poll_interval
 
 
 def _open_lock_handle(lock_path):
@@ -368,10 +404,40 @@ def _finish_path_activity(lock_path, activity_event):
             activity_event.set()
 
 
+def _rollback_acquired_handle(
+    lock_path, handle, current_owner, activity_event, lock_info
+):
+    """Undo a failed in-memory commit after the OS lock was acquired."""
+    with _registry_guard():
+        if _lock_file_handles.get(lock_path) is lock_info:
+            _lock_file_handles.pop(lock_path, None)
+        _remove_recorded_path(current_owner, lock_path)
+        _pending_handles.add(handle)
+        if _path_activity.get(lock_path) is activity_event:
+            _path_activity.pop(lock_path, None)
+            activity_event.set()
+        lock_info["released_event"].set()
+
+    try:
+        _unlock_os_lock(handle)
+    except Exception:
+        pass
+    try:
+        _discard_pending_handle(handle)
+    except Exception:
+        pass
+
+
 def _fallback_after_open_error(lock_name, base_dir, lock_path, error):
     if base_dir is not None or not _is_bare_lock_name(lock_name):
         return None
-    if error.errno not in {errno.EACCES, errno.EPERM, errno.EROFS, errno.ENOENT, errno.ENOTDIR}:
+    if error.errno not in {
+        errno.EACCES,
+        errno.EPERM,
+        errno.EROFS,
+        errno.ENOENT,
+        errno.ENOTDIR,
+    }:
         return None
 
     fallback_path = os.path.realpath(
@@ -399,7 +465,8 @@ def force_single(
     current_thread = _current_owner()
     if block and not isinstance(current_thread, threading.Thread):
         raise ValueError(
-            "block=True cannot be used from an asyncio task; run the blocking call in an executor"
+            "block=True cannot be used from an asyncio task; "
+            "await force_single_async() instead"
         )
 
     # Reuse the original path without re-running fallback logic for a
@@ -444,7 +511,9 @@ def force_single(
                     lock_name, base_dir, lock_path, exc
                 )
             except OSError as fallback_exc:
-                raise _operation_error("prepare", lock_path, fallback_exc) from fallback_exc
+                raise _operation_error(
+                    "prepare", lock_path, fallback_exc
+                ) from fallback_exc
             if fallback_path is not None:
                 lock_path = fallback_path
                 continue
@@ -459,7 +528,9 @@ def force_single(
                 _handle_conflict(
                     lock_name,
                     raise_on_conflict,
-                    "Lock '{}' is already acquired by another process.".format(lock_name),
+                    "Lock '{}' is already acquired by another process.".format(
+                        lock_name
+                    ),
                     cause=exc,
                 )
             raise _operation_error("acquire", lock_path, exc) from exc
@@ -468,22 +539,72 @@ def force_single(
             _finish_path_activity(lock_path, activity_event)
             raise
 
-        with _registry_guard():
-            _pending_handles.discard(handle)
-            _lock_file_handles[lock_path] = {
-                "handle": handle,
-                "owner_thread": current_thread,
-                # Kept for diagnostics and compatibility with code inspecting
-                # the previous private registry shape.
-                "owner_thread_id": _owner_identifier(current_thread),
-                "ref_count": 1,
-                "released_event": threading.Event(),
-            }
-            _record_acquisition(current_thread, logical_key, lock_path)
-            if _path_activity.get(lock_path) is activity_event:
-                _path_activity.pop(lock_path, None)
-                activity_event.set()
+        lock_info = {
+            "handle": handle,
+            "owner_thread": current_thread,
+            # Kept for diagnostics and compatibility with code inspecting
+            # the previous private registry shape.
+            "owner_thread_id": _owner_identifier(current_thread),
+            "ref_count": 1,
+            "released_event": threading.Event(),
+        }
+        try:
+            with _registry_guard():
+                _lock_file_handles[lock_path] = lock_info
+                _record_acquisition(current_thread, logical_key, lock_path)
+                _pending_handles.discard(handle)
+                if _path_activity.get(lock_path) is activity_event:
+                    _path_activity.pop(lock_path, None)
+                    activity_event.set()
+        except BaseException:
+            _rollback_acquired_handle(
+                lock_path,
+                handle,
+                current_thread,
+                activity_event,
+                lock_info,
+            )
+            raise
         return
+
+
+async def force_single_async(
+    lock_name: str = "yyds_instance.lock",
+    timeout: float = None,
+    poll_interval: float = 0.05,
+    base_dir: str = None,
+):
+    """Wait asynchronously until a named lock is acquired by this Task.
+
+    The operating-system acquisition remains non-blocking on every attempt,
+    so the event loop stays responsive.  A finite timeout raises
+    ``LockTimeoutError`` when contention does not clear in time.
+    """
+    timeout, poll_interval = _validate_async_wait_options(timeout, poll_interval)
+    deadline = None if timeout is None else time.monotonic() + timeout
+
+    while True:
+        try:
+            force_single(
+                lock_name,
+                block=False,
+                raise_on_conflict=True,
+                base_dir=base_dir,
+            )
+            return
+        except AlreadyLockedError as exc:
+            if deadline is None:
+                delay = poll_interval
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise LockTimeoutError(
+                        "Timed out after {:.3f}s waiting for lock '{}'.".format(
+                            timeout, lock_name
+                        )
+                    ) from exc
+                delay = min(poll_interval, remaining)
+            await asyncio.sleep(delay)
 
 
 def release_single(lock_name: str = "yyds_instance.lock", base_dir: str = None):
@@ -511,7 +632,9 @@ def release_single(lock_name: str = "yyds_instance.lock", base_dir: str = None):
         if info["owner_thread"] is not current_thread:
             raise RuntimeError(
                 "Cannot release lock '{}' owned by execution owner {} from owner {}.".format(
-                    lock_name, info["owner_thread_id"], _owner_identifier(current_thread)
+                    lock_name,
+                    info["owner_thread_id"],
+                    _owner_identifier(current_thread),
                 )
             )
 
@@ -621,23 +744,36 @@ def single_decorator(
     block: bool = False,
     raise_on_conflict: bool = False,
     base_dir: str = None,
+    timeout: float = None,
+    poll_interval: float = 0.05,
 ):
     """Decorate sync, coroutine, generator, or async-generator functions."""
+    if timeout is not None and not block:
+        raise ValueError("timeout requires block=True")
 
     def decorator(func):
         def resolved_name(args, kwargs):
             return lock_name(*args, **kwargs) if callable(lock_name) else lock_name
 
         if inspect.isasyncgenfunction(func):
-            if block:
-                raise ValueError(
-                    "block=True is not supported for async decorators; it would block the event loop"
-                )
 
             @wraps(func)
             async def async_generator_wrapper(*args, **kwargs):
                 resolved_lock_name = resolved_name(args, kwargs)
-                force_single(resolved_lock_name, block, raise_on_conflict, base_dir)
+                if block:
+                    await force_single_async(
+                        resolved_lock_name,
+                        timeout=timeout,
+                        poll_interval=poll_interval,
+                        base_dir=base_dir,
+                    )
+                else:
+                    force_single(
+                        resolved_lock_name,
+                        block=False,
+                        raise_on_conflict=raise_on_conflict,
+                        base_dir=base_dir,
+                    )
                 try:
                     async for item in func(*args, **kwargs):
                         yield item
@@ -647,15 +783,24 @@ def single_decorator(
             return async_generator_wrapper
 
         if inspect.iscoroutinefunction(func):
-            if block:
-                raise ValueError(
-                    "block=True is not supported for async decorators; it would block the event loop"
-                )
 
             @wraps(func)
             async def async_wrapper(*args, **kwargs):
                 resolved_lock_name = resolved_name(args, kwargs)
-                force_single(resolved_lock_name, block, raise_on_conflict, base_dir)
+                if block:
+                    await force_single_async(
+                        resolved_lock_name,
+                        timeout=timeout,
+                        poll_interval=poll_interval,
+                        base_dir=base_dir,
+                    )
+                else:
+                    force_single(
+                        resolved_lock_name,
+                        block=False,
+                        raise_on_conflict=raise_on_conflict,
+                        base_dir=base_dir,
+                    )
                 try:
                     return await func(*args, **kwargs)
                 finally:
@@ -664,6 +809,9 @@ def single_decorator(
             return async_wrapper
 
         if inspect.isgeneratorfunction(func):
+            if timeout is not None:
+                raise ValueError("timeout is only supported by asynchronous decorators")
+
             @wraps(func)
             def generator_wrapper(*args, **kwargs):
                 resolved_lock_name = resolved_name(args, kwargs)
@@ -674,6 +822,9 @@ def single_decorator(
                     release_single(resolved_lock_name, base_dir)
 
             return generator_wrapper
+
+        if timeout is not None:
+            raise ValueError("timeout is only supported by asynchronous decorators")
 
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -686,15 +837,12 @@ def single_decorator(
 
         return wrapper
 
-
     return decorator
 
 
 def _cleanup_all():
     with _registry_guard():
-        acquired_handles = [
-            info["handle"] for info in _lock_file_handles.values()
-        ]
+        acquired_handles = [info["handle"] for info in _lock_file_handles.values()]
         pending_handles = list(_pending_handles)
         unique_handles = {
             id(handle): handle for handle in acquired_handles + pending_handles
@@ -737,13 +885,12 @@ atexit.register(_cleanup_all)
 
 
 if hasattr(os, "register_at_fork"):
+
     def _before_fork():
         _fork_gate.acquire()
 
-
     def _after_fork_parent():
         _fork_gate.release()
-
 
     def _after_fork_child():
         # Do not call LOCK_UN in the child: the open file description may be
@@ -773,7 +920,6 @@ if hasattr(os, "register_at_fork"):
         # threads.  Fresh objects make the child immediately usable.
         _registry_lock = threading.Lock()
         _fork_gate = threading.RLock()
-
 
     os.register_at_fork(
         before=_before_fork,

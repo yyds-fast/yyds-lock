@@ -1,0 +1,2 @@
+include README_CN.md
+recursive-include example *.py

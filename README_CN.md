@@ -13,6 +13,7 @@
 - 🪶 **零第三方依赖（Zero Dependencies）**：100% Python 标准库实现，不安装任何运行时依赖包。
 - 🎛️ **双模式切换（Dual Modes）**：既支持发现重复进程后“优雅秒退”模式（非阻塞，打印红色错误并以退出码 `1` 退出），也支持“排队等候”模式（阻塞等待前一个实例运行结束）。
 - 🧵 **线程与任务隔离**：同一进程内的不同线程或 asyncio Task 可以正确互斥，分别等待或触发冲突；重入仅对同一个仍存活的执行所有者生效。
+- ⚡ **异步安全等待**：`force_single_async` 和异步装饰器不会阻塞事件循环，并支持有限超时。
 - 🔱 **进程派生安全（Fork-Safety）**：在 Unix `fork()` 前同步注册表变更；子进程关闭已获取及获取中的继承句柄，并重建线程同步对象，不会解锁父进程。
 - 📁 **只读目录自动降级**：家目录不可写或不存在时，裸文件名会降级到系统临时目录下的当前用户私有目录；显式 `base_dir` 失败时不会静默换路径。
 - 🧹 **自动资源清理**：注册 `atexit` 清理钩子，在 Python 解释器正常退出时自动关闭所有打开的文件锁句柄，彻底消除 `ResourceWarning` 警告。
@@ -97,15 +98,36 @@ with SingleInstanceLock("my_task.lock", raise_on_conflict=True):
     run_task()
 ```
 
-装饰器也会在 coroutine、generator 和 async generator 的完整执行周期内持锁。同步等待会阻塞事件循环，因此 asyncio Task 内明确拒绝 `block=True`；如确需阻塞获取，请放到 executor 中运行。
+装饰器也会在 coroutine、generator 和 async generator 的完整执行周期内持锁；异步装饰器可以安全使用 `block=True`，不会阻塞事件循环。
+
+### 姿势 E：带超时的异步等待
+
+应当在最终负责释放锁的同一个 Task 中调用 `force_single_async`：
+
+```python
+from yyds_lock import LockTimeoutError, force_single_async, release_single
+
+async def run_job():
+    try:
+        await force_single_async("my_async_job.lock", timeout=10)
+    except LockTimeoutError:
+        return
+
+    try:
+        await do_work()
+    finally:
+        release_single("my_async_job.lock")
+```
+
+不要在 executor 中获取后回到事件循环 Task 释放：锁归属于实际执行获取操作的 Thread 或 Task。若必须使用 executor，获取、业务执行和释放必须放在同一次 executor 调用中完成。
 
 ---
 
 ## 配置参数说明
 
-`force_single` 和 `single_decorator` 均接受以下参数：
+`force_single` 和 `single_decorator` 共享以下核心参数：
 
-- `lock_name` (str 或 callable)：锁文件的名称/路径，或者在装饰器模式下传入的动态生成锁名的 Callable。
+- `lock_name` (str 或 `os.PathLike`)：锁文件的名称/路径。只有 `single_decorator` 额外支持 Callable，可根据被装饰函数的参数动态生成锁名。
   - 如果仅传入文件名（如 `"my_job.lock"`），锁文件会自动创建在用户家目录的隐藏文件夹 `~/.yyds_lock` 下（若不存在或不可写，会自动安全降级至系统临时目录）。
   - 如果传入的是相对路径或绝对路径（如 `"/var/run/my_job.lock"`），则会在对应路径创建。如果父级目录不存在，会自动创建。
 - `block` (bool)：
@@ -115,6 +137,13 @@ with SingleInstanceLock("my_task.lock", raise_on_conflict=True):
   - `False`（默认值）：锁被占用时，直接向日志系统或 stderr 输出错误并以退出码 `1` 退出进程。
   - `True`：锁被占用时，抛出 `AlreadyLockedError` 异常，允许调用者捕获并进行自定义处理。
 - `base_dir` (str 或 `os.PathLike`, 可选)：覆盖裸文件名默认使用的 `~/.yyds_lock`。显式目录不可用时抛出 `LockOperationError`，不会静默降级。
+
+`force_single_async` 接受 `lock_name`、`base_dir`，以及：
+
+- `timeout` (float 或 `None`)：最长等待秒数。`None` 表示无限等待；超时会抛出 `LockTimeoutError`。
+- `poll_interval` (float)：非阻塞重试间隔，默认 `0.05` 秒。
+
+对于 coroutine 和 async-generator 装饰器，`block=True` 时可通过 `timeout` 和 `poll_interval` 配置异步等待。
 
 ---
 
