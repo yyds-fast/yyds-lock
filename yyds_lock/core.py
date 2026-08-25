@@ -16,7 +16,7 @@ import threading
 import time
 from contextlib import contextmanager
 from functools import wraps
-from typing import Any, Optional, Union
+from typing import Any
 
 
 _default_logger = logging.getLogger("yyds_lock")
@@ -719,8 +719,8 @@ def release_single(
                 lock_path,
                 unlock_error,
             )
-        elif _module_logger.hasHandlers():
-            _module_logger.warning("Unable to explicitly unlock '%s': %s", lock_path, unlock_error)
+        elif _default_logger.hasHandlers():
+            _default_logger.warning("Unable to explicitly unlock '%s': %s", lock_path, unlock_error)
 
 
 class SingleInstanceLock:
