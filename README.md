@@ -137,8 +137,9 @@ Do not acquire in an executor and release from the event-loop Task: lock ownersh
   - `False` (default): Immediately log an error and call `sys.exit(1)` when the lock is already held.
   - `True`: Raise `AlreadyLockedError` when the lock is already held, allowing the caller to catch it.
 - `base_dir` (str or `os.PathLike`, optional): Overrides the default folder (`~/.yyds_lock`) for simple filenames. Failure to use an explicit directory raises `LockOperationError`; it is not silently replaced.
+- `logger` (optional): Pass an already initialized Logger instance (such as `yyds-logger`, standard library `logging.Logger`, `loguru`, or a custom wrapper). When a conflict or error occurs, messages are emitted directly to this logger.
 
-`force_single_async` accepts `lock_name` and `base_dir` plus:
+`force_single_async` accepts `lock_name`, `base_dir`, `logger`, plus:
 
 - `timeout` (float or `None`): Maximum wait in seconds. `None` waits indefinitely; expiration raises `LockTimeoutError`.
 - `poll_interval` (float): Delay between non-blocking attempts, defaulting to `0.05` seconds.
@@ -149,7 +150,23 @@ For coroutine and async-generator decorators, `timeout` and `poll_interval` conf
 
 ## Logging
 
-`yyds-lock` uses Python's standard `logging` library. All lock conflicts and warning outputs are logged using:
+`yyds-lock` supports two ways of emitting conflict and warning messages:
+
+### 1. Passing a Custom Logger (Recommended)
+Pass an existing logger instance to `force_single`, `SingleInstanceLock`, or `@single_decorator`:
+
+```python
+from yyds_lock import force_single
+from yyds_logger import Logger  # or loguru, standard logging.Logger
+
+my_logger = Logger('./logs/my_spider.log', 'debug').logger
+
+# Conflict error will be written directly to my_logger upon exit
+force_single(lock_name="my_spider.lock", block=False, logger=my_logger)
+```
+
+### 2. Default `yyds_lock` Logger
+If no custom logger is passed, `yyds-lock` uses the standard library logger named `"yyds_lock"`:
 ```python
 import logging
 logger = logging.getLogger("yyds_lock")

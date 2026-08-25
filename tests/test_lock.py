@@ -1057,6 +1057,157 @@ with tempfile.TemporaryDirectory() as directory:
             handle.seek(0, os.SEEK_END)
             self.assertEqual(handle.tell(), 1)
 
+    def test_custom_standard_logger_receives_conflict_log(self):
+        import logging
+        import tempfile
+        from unittest.mock import MagicMock
+
+        custom_logger = logging.getLogger("test_custom_logger")
+        mock_handler = MagicMock()
+        mock_handler.level = logging.INFO
+        custom_logger.addHandler(mock_handler)
+        custom_logger.setLevel(logging.INFO)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "custom_logger.lock")
+            force_single(lock_path, raise_on_conflict=True)
+            errors = []
+
+            def contender():
+                try:
+                    force_single(lock_path, block=False, logger=custom_logger)
+                except SystemExit as exc:
+                    errors.append(exc.code)
+
+            thread = threading.Thread(target=contender)
+            thread.start()
+            thread.join()
+
+            release_single(lock_path)
+
+        self.assertEqual(errors, [1])
+        self.assertTrue(mock_handler.handle.called)
+        record = mock_handler.handle.call_args[0][0]
+        self.assertIn("[yyds-lock] 错误: 脚本进程已在运行中，当前实例自动退出！", record.getMessage())
+        self.assertEqual(record.levelno, logging.ERROR)
+
+    def test_custom_duck_typed_logger_receives_conflict_log(self):
+        import tempfile
+
+        class CustomYydsLogger:
+            def __init__(self):
+                self.messages = []
+
+            def error(self, msg, *args, **kwargs):
+                self.messages.append(msg)
+
+        custom_logger = CustomYydsLogger()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "duck_logger.lock")
+            force_single(lock_path, raise_on_conflict=True)
+            errors = []
+
+            def contender():
+                try:
+                    force_single(lock_path, block=False, logger=custom_logger)
+                except SystemExit as exc:
+                    errors.append(exc.code)
+
+            thread = threading.Thread(target=contender)
+            thread.start()
+            thread.join()
+
+            release_single(lock_path)
+
+        self.assertEqual(errors, [1])
+        self.assertEqual(len(custom_logger.messages), 1)
+        self.assertIn("[yyds-lock] 错误", custom_logger.messages[0])
+
+    def test_custom_callable_logger_receives_conflict_log(self):
+        import tempfile
+
+        logs = []
+
+        def callable_logger(msg):
+            logs.append(msg)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "callable_logger.lock")
+            force_single(lock_path, raise_on_conflict=True)
+            errors = []
+
+            def contender():
+                try:
+                    force_single(lock_path, block=False, logger=callable_logger)
+                except SystemExit as exc:
+                    errors.append(exc.code)
+
+            thread = threading.Thread(target=contender)
+            thread.start()
+            thread.join()
+
+            release_single(lock_path)
+
+        self.assertEqual(errors, [1])
+        self.assertEqual(len(logs), 1)
+        self.assertIn("[yyds-lock] 错误", logs[0])
+
+    def test_single_instance_lock_and_decorator_with_logger(self):
+        import tempfile
+
+        logs = []
+
+        class MockLogger:
+            def error(self, msg):
+                logs.append(msg)
+
+        logger_inst = MockLogger()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "ctx_logger.lock")
+            force_single(lock_path, raise_on_conflict=True)
+
+            errors = []
+
+            def contender_ctx():
+                try:
+                    with SingleInstanceLock(lock_path, block=False, logger=logger_inst):
+                        pass
+                except SystemExit as exc:
+                    errors.append(exc.code)
+
+            thread = threading.Thread(target=contender_ctx)
+            thread.start()
+            thread.join()
+
+            self.assertEqual(errors, [1])
+            self.assertEqual(len(logs), 1)
+            self.assertIn("[yyds-lock] 错误", logs[0])
+
+            @single_decorator(lock_name=lock_path, block=False, logger=logger_inst)
+            def protected_func():
+                return "ok"
+
+            errors.clear()
+            logs.clear()
+
+            def contender_dec():
+                try:
+                    protected_func()
+                except SystemExit as exc:
+                    errors.append(exc.code)
+
+            thread2 = threading.Thread(target=contender_dec)
+            thread2.start()
+            thread2.join()
+
+            self.assertEqual(errors, [1])
+            self.assertEqual(len(logs), 1)
+            self.assertIn("[yyds-lock] 错误", logs[0])
+
+            release_single(lock_path)
+
 
 if __name__ == "__main__":
     unittest.main()

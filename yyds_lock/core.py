@@ -16,9 +16,11 @@ import threading
 import time
 from contextlib import contextmanager
 from functools import wraps
+from typing import Any, Optional, Union
 
 
-logger = logging.getLogger("yyds_lock")
+_default_logger = logging.getLogger("yyds_lock")
+logger = _default_logger
 
 
 class YYDSLockError(Exception):
@@ -244,7 +246,32 @@ def _conflict_message():
     return "[yyds-lock] 错误: 脚本进程已在运行中，当前实例自动退出！"
 
 
-def _handle_conflict(lock_name, raise_on_conflict, detail, cause=None):
+def _emit_log(custom_logger, level: str, message: str, *args, **kwargs):
+    if custom_logger is None:
+        return False
+    log_func = getattr(custom_logger, level, None)
+    if callable(log_func):
+        try:
+            log_func(message, *args, **kwargs)
+        except TypeError:
+            log_func(message)
+        return True
+    elif callable(custom_logger):
+        try:
+            custom_logger(message, *args, **kwargs)
+        except TypeError:
+            custom_logger(message)
+        return True
+    return False
+
+
+def _handle_conflict(
+    lock_name,
+    raise_on_conflict,
+    detail,
+    cause=None,
+    custom_logger=None,
+):
     if raise_on_conflict:
         error = AlreadyLockedError(detail)
         if cause is not None:
@@ -252,8 +279,10 @@ def _handle_conflict(lock_name, raise_on_conflict, detail, cause=None):
         raise error
 
     message = _conflict_message()
-    if logger.hasHandlers():
-        logger.error(message)
+    if custom_logger is not None:
+        _emit_log(custom_logger, "error", message)
+    elif _default_logger.hasHandlers():
+        _default_logger.error(message)
     else:
         use_color = bool(getattr(sys.stderr, "isatty", lambda: False)())
         output = "\033[31m{}\033[0m".format(message) if use_color else message
@@ -454,6 +483,7 @@ def force_single(
     block: bool = False,
     raise_on_conflict: bool = False,
     base_dir: str = None,
+    logger: Any = None,
 ):
     """Acquire a process-, thread-, and task-exclusive named file lock.
 
@@ -499,6 +529,7 @@ def force_single(
                 "Lock '{}' is already acquired by execution owner {} in this process.".format(
                     lock_name, owner
                 ),
+                custom_logger=logger,
             )
 
         activity_event = claim_data
@@ -532,6 +563,7 @@ def force_single(
                         lock_name
                     ),
                     cause=exc,
+                    custom_logger=logger,
                 )
             raise _operation_error("acquire", lock_path, exc) from exc
         except BaseException:
@@ -573,6 +605,7 @@ async def force_single_async(
     timeout: float = None,
     poll_interval: float = 0.05,
     base_dir: str = None,
+    logger: Any = None,
 ):
     """Wait asynchronously until a named lock is acquired by this Task.
 
@@ -590,6 +623,7 @@ async def force_single_async(
                 block=False,
                 raise_on_conflict=True,
                 base_dir=base_dir,
+                logger=logger,
             )
             return
         except AlreadyLockedError as exc:
@@ -607,7 +641,11 @@ async def force_single_async(
             await asyncio.sleep(delay)
 
 
-def release_single(lock_name: str = "yyds_instance.lock", base_dir: str = None):
+def release_single(
+    lock_name: str = "yyds_instance.lock",
+    base_dir: str = None,
+    logger: Any = None,
+):
     """Release one acquisition owned by the current execution owner."""
     logical_key = _logical_lock_key(lock_name, base_dir)
     lock_name = logical_key[0]
@@ -668,8 +706,17 @@ def release_single(lock_name: str = "yyds_instance.lock", base_dir: str = None):
                     _path_activity.pop(lock_path, None)
                     release_event.set()
 
-    if unlock_error is not None and logger.hasHandlers():
-        logger.warning("Unable to explicitly unlock '%s': %s", lock_path, unlock_error)
+    if unlock_error is not None:
+        if logger is not None:
+            _emit_log(
+                logger,
+                "warning",
+                "Unable to explicitly unlock '%s': %s",
+                lock_path,
+                unlock_error,
+            )
+        elif _module_logger.hasHandlers():
+            _module_logger.warning("Unable to explicitly unlock '%s': %s", lock_path, unlock_error)
 
 
 class SingleInstanceLock:
@@ -681,11 +728,13 @@ class SingleInstanceLock:
         block=False,
         raise_on_conflict=False,
         base_dir=None,
+        logger=None,
     ):
         self.lock_name = lock_name
         self.block = block
         self.raise_on_conflict = raise_on_conflict
         self.base_dir = base_dir
+        self.logger = logger
         self._acquired = False
         self._owner = None
         self._state_lock = threading.Lock()
@@ -714,6 +763,7 @@ class SingleInstanceLock:
                 block=self.block,
                 raise_on_conflict=self.raise_on_conflict,
                 base_dir=self.base_dir,
+                logger=self.logger,
             )
             self._owner = _current_owner()
             self._acquired = True
@@ -728,7 +778,7 @@ class SingleInstanceLock:
                 raise RuntimeError(
                     "SingleInstanceLock must be released by the execution owner that acquired it"
                 )
-            release_single(self.lock_name, self.base_dir)
+            release_single(self.lock_name, self.base_dir, logger=self.logger)
             self._acquired = False
             self._owner = None
 
@@ -746,6 +796,7 @@ def single_decorator(
     base_dir: str = None,
     timeout: float = None,
     poll_interval: float = 0.05,
+    logger: Any = None,
 ):
     """Decorate sync, coroutine, generator, or async-generator functions."""
     if timeout is not None and not block:
@@ -766,6 +817,7 @@ def single_decorator(
                         timeout=timeout,
                         poll_interval=poll_interval,
                         base_dir=base_dir,
+                        logger=logger,
                     )
                 else:
                     force_single(
@@ -773,12 +825,13 @@ def single_decorator(
                         block=False,
                         raise_on_conflict=raise_on_conflict,
                         base_dir=base_dir,
+                        logger=logger,
                     )
                 try:
                     async for item in func(*args, **kwargs):
                         yield item
                 finally:
-                    release_single(resolved_lock_name, base_dir)
+                    release_single(resolved_lock_name, base_dir, logger=logger)
 
             return async_generator_wrapper
 
@@ -793,6 +846,7 @@ def single_decorator(
                         timeout=timeout,
                         poll_interval=poll_interval,
                         base_dir=base_dir,
+                        logger=logger,
                     )
                 else:
                     force_single(
@@ -800,11 +854,12 @@ def single_decorator(
                         block=False,
                         raise_on_conflict=raise_on_conflict,
                         base_dir=base_dir,
+                        logger=logger,
                     )
                 try:
                     return await func(*args, **kwargs)
                 finally:
-                    release_single(resolved_lock_name, base_dir)
+                    release_single(resolved_lock_name, base_dir, logger=logger)
 
             return async_wrapper
 
@@ -815,11 +870,17 @@ def single_decorator(
             @wraps(func)
             def generator_wrapper(*args, **kwargs):
                 resolved_lock_name = resolved_name(args, kwargs)
-                force_single(resolved_lock_name, block, raise_on_conflict, base_dir)
+                force_single(
+                    resolved_lock_name,
+                    block,
+                    raise_on_conflict,
+                    base_dir,
+                    logger=logger,
+                )
                 try:
                     yield from func(*args, **kwargs)
                 finally:
-                    release_single(resolved_lock_name, base_dir)
+                    release_single(resolved_lock_name, base_dir, logger=logger)
 
             return generator_wrapper
 
@@ -829,11 +890,17 @@ def single_decorator(
         @wraps(func)
         def wrapper(*args, **kwargs):
             resolved_lock_name = resolved_name(args, kwargs)
-            force_single(resolved_lock_name, block, raise_on_conflict, base_dir)
+            force_single(
+                resolved_lock_name,
+                block,
+                raise_on_conflict,
+                base_dir,
+                logger=logger,
+            )
             try:
                 return func(*args, **kwargs)
             finally:
-                release_single(resolved_lock_name, base_dir)
+                release_single(resolved_lock_name, base_dir, logger=logger)
 
         return wrapper
 

@@ -137,8 +137,9 @@ async def run_job():
   - `False`（默认值）：锁被占用时，直接向日志系统或 stderr 输出错误并以退出码 `1` 退出进程。
   - `True`：锁被占用时，抛出 `AlreadyLockedError` 异常，允许调用者捕获并进行自定义处理。
 - `base_dir` (str 或 `os.PathLike`, 可选)：覆盖裸文件名默认使用的 `~/.yyds_lock`。显式目录不可用时抛出 `LockOperationError`，不会静默降级。
+- `logger` (可选)：传入已初始化好的 Logger 对象（如 `yyds-logger`、标准库 `logging.Logger`、`loguru` 或自定义包装器）。当发生冲突或错误时，直接通过该 logger 记录日志。
 
-`force_single_async` 接受 `lock_name`、`base_dir`，以及：
+`force_single_async` 接受 `lock_name`、`base_dir`、`logger`，以及：
 
 - `timeout` (float 或 `None`)：最长等待秒数。`None` 表示无限等待；超时会抛出 `LockTimeoutError`。
 - `poll_interval` (float)：非阻塞重试间隔，默认 `0.05` 秒。
@@ -149,12 +150,28 @@ async def run_job():
 
 ## 企业级日志系统集成
 
-`yyds-lock` 集成了 Python 标准的 `logging` 日志系统。所有锁冲突和运行警告均通过以下 Logger 输出：
+`yyds-lock` 支持两种方式输出冲突与告警日志：
+
+### 1. 传入已初始化的自定义 Logger（推荐，如 yyds-logger）
+直接将已有 logger 实例作为参数传入 `force_single`、`SingleInstanceLock` 或 `@single_decorator` 中，锁冲突时会自动记录到对应的日志文件：
+
+```python
+from yyds_lock import force_single
+from yyds_logger import Logger  # 或自定义 logger / loguru
+
+my_logger = Logger('./logs/my_spider.log', 'debug').logger
+
+# 锁发生冲突时，将自动通过 my_logger.error(...) 写入日志文件并退出
+force_single(lock_name="my_spider.lock", block=False, logger=my_logger)
+```
+
+### 2. 标准库 `yyds_lock` 全局 Logger
+若未传入自定义 logger，`yyds-lock` 默认使用名为 `"yyds_lock"` 的标准库 Logger：
 ```python
 import logging
 logger = logging.getLogger("yyds_lock")
 ```
-配置了有效 Handler 时，冲突只通过日志输出一次；没有 Handler 时，只向 `sys.stderr` 输出一次，并且仅在终端环境使用颜色。
+配置了有效 Handler 时，冲突只通过日志输出一次；没有 Handler 时，只向 `sys.stderr` 输出一次（仅在终端环境使用颜色）。
 
 ---
 
