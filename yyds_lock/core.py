@@ -244,10 +244,11 @@ def _remove_recorded_path(thread, lock_path):
 
 def _write_lock_metadata(handle):
     try:
-        handle.seek(0)
+        offset = 1 if os.name == "nt" else 0
+        handle.seek(offset)
         payload = "{}\n".format(os.getpid()).encode("utf-8")
         handle.write(payload)
-        handle.truncate()
+        handle.truncate(offset + len(payload))
         handle.flush()
     except Exception:
         pass
@@ -255,7 +256,10 @@ def _write_lock_metadata(handle):
 
 def _read_lock_pid(lock_path):
     try:
+        offset = 1 if os.name == "nt" else 0
         with open(lock_path, "rb") as f:
+            if offset:
+                f.seek(offset)
             content = f.read(64).decode("utf-8", "ignore").strip()
             if content:
                 first_line = content.splitlines()[0].strip()

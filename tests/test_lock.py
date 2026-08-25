@@ -700,7 +700,9 @@ with tempfile.TemporaryDirectory() as directory:
             release_single(lock_path)
 
         self.assertEqual(errors, [1])
-        self.assertEqual(stderr.getvalue().count("[yyds-lock] Failed to acquire lock"), 1)
+        self.assertEqual(
+            stderr.getvalue().count("[yyds-lock] Failed to acquire lock"), 1
+        )
         self.assertNotIn("\033", stderr.getvalue())
 
     def test_non_conflict_os_error_is_not_reported_as_locked(self):
@@ -1212,6 +1214,45 @@ with tempfile.TemporaryDirectory() as directory:
             self.assertIn("[yyds-lock] Failed to acquire lock", logs[0])
 
             release_single(lock_path)
+
+    def test_lock_metadata_windows_and_posix(self):
+        import tempfile
+        from unittest.mock import patch
+        from yyds_lock import core
+
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            lock_path = f.name
+
+        try:
+            # Test Windows metadata write and read (offset 1)
+            with patch.object(core.os, "name", "nt"):
+                with open(lock_path, "w+b") as handle:
+                    core._prepare_windows_lock_byte(handle)
+                    core._write_lock_metadata(handle)
+
+                with open(lock_path, "rb") as handle:
+                    data = handle.read()
+                    self.assertTrue(data.startswith(b"\x00"))
+                    self.assertIn(str(os.getpid()).encode("utf-8"), data)
+
+                read_pid = core._read_lock_pid(lock_path)
+                self.assertEqual(read_pid, os.getpid())
+
+            # Test POSIX metadata write and read (offset 0)
+            with patch.object(core.os, "name", "posix"):
+                with open(lock_path, "w+b") as handle:
+                    core._write_lock_metadata(handle)
+
+                with open(lock_path, "rb") as handle:
+                    data = handle.read()
+                    self.assertFalse(data.startswith(b"\x00"))
+                    self.assertTrue(data.startswith(str(os.getpid()).encode("utf-8")))
+
+                read_pid = core._read_lock_pid(lock_path)
+                self.assertEqual(read_pid, os.getpid())
+        finally:
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
 
 
 if __name__ == "__main__":

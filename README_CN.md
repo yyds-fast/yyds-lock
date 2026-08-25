@@ -55,15 +55,20 @@ time.sleep(300)
 ```python
 import yyds_lock
 
+
 # 1. 静态锁文件名
 @yyds_lock.single_decorator(lock_name="my_task.lock", block=False)
 def main():
     print("安全运行中，绝无重复启动隐患...")
 
+
 # 2. 动态锁文件名（根据参数动态互斥）
-@yyds_lock.single_decorator(lock_name=lambda user_id: f"user_{user_id}.lock", block=False)
+@yyds_lock.single_decorator(
+    lock_name=lambda user_id: f"user_{user_id}.lock", block=False
+)
 def process_user(user_id):
     print(f"正在排他性地处理用户 {user_id} 的数据...")
+
 
 if __name__ == "__main__":
     main()
@@ -79,7 +84,9 @@ import yyds_lock
 from yyds_lock import AlreadyLockedError
 
 try:
-    yyds_lock.force_single(lock_name="my_automation.lock", block=False, raise_on_conflict=True)
+    yyds_lock.force_single(
+        lock_name="my_automation.lock", block=False, raise_on_conflict=True
+    )
 except AlreadyLockedError:
     print("未能成功获取锁，正在执行降级脚本...")
     # 在这里添加自定义的降级/备份逻辑
@@ -106,6 +113,7 @@ with SingleInstanceLock("my_task.lock", raise_on_conflict=True):
 
 ```python
 from yyds_lock import LockTimeoutError, force_single_async, release_single
+
 
 async def run_job():
     try:
@@ -159,7 +167,7 @@ async def run_job():
 from yyds_lock import force_single
 from yyds_logger import Logger  # 或自定义 logger / loguru
 
-my_logger = Logger('./logs/my_spider.log', 'debug').logger
+my_logger = Logger("./logs/my_spider.log", "debug").logger
 
 # 锁发生冲突时，将自动通过 my_logger.error(...) 写入日志文件并退出
 force_single(lock_name="my_spider.lock", block=False, logger=my_logger)
@@ -169,6 +177,7 @@ force_single(lock_name="my_spider.lock", block=False, logger=my_logger)
 若未传入自定义 logger，`yyds-lock` 默认使用名为 `"yyds_lock"` 的标准库 Logger：
 ```python
 import logging
+
 logger = logging.getLogger("yyds_lock")
 ```
 配置了有效 Handler 时，冲突只通过日志输出一次；没有 Handler 时，只向 `sys.stderr` 输出一次（仅在终端环境使用颜色）。

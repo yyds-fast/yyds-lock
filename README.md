@@ -55,15 +55,18 @@ Decorate your functions to enforce mutual exclusion. The `lock_name` parameter c
 ```python
 import yyds_lock
 
+
 # 1. Static lock name
 @yyds_lock.single_decorator(lock_name="my_task.lock", block=False)
 def main():
     print("Executing single instance task safely...")
 
+
 # 2. Dynamic lock name based on arguments
 @yyds_lock.single_decorator(lock_name=lambda job_id: f"job_{job_id}.lock", block=False)
 def process_job(job_id):
     print(f"Processing job {job_id} exclusively...")
+
 
 if __name__ == "__main__":
     main()
@@ -79,7 +82,9 @@ import yyds_lock
 from yyds_lock import AlreadyLockedError
 
 try:
-    yyds_lock.force_single(lock_name="my_automation.lock", block=False, raise_on_conflict=True)
+    yyds_lock.force_single(
+        lock_name="my_automation.lock", block=False, raise_on_conflict=True
+    )
 except AlreadyLockedError:
     print("Failed to acquire lock. Running fallback script instead...")
     # Add custom fallback actions here
@@ -106,6 +111,7 @@ Use `force_single_async` directly from the Task that will eventually release the
 
 ```python
 from yyds_lock import LockTimeoutError, force_single_async, release_single
+
 
 async def run_job():
     try:
@@ -159,7 +165,7 @@ Pass an existing logger instance to `force_single`, `SingleInstanceLock`, or `@s
 from yyds_lock import force_single
 from yyds_logger import Logger  # or loguru, standard logging.Logger
 
-my_logger = Logger('./logs/my_spider.log', 'debug').logger
+my_logger = Logger("./logs/my_spider.log", "debug").logger
 
 # Conflict error will be written directly to my_logger upon exit
 force_single(lock_name="my_spider.lock", block=False, logger=my_logger)
@@ -169,6 +175,7 @@ force_single(lock_name="my_spider.lock", block=False, logger=my_logger)
 If no custom logger is passed, `yyds-lock` uses the standard library logger named `"yyds_lock"`:
 ```python
 import logging
+
 logger = logging.getLogger("yyds_lock")
 ```
 If an effective handler is configured, conflicts are emitted once through logging. Otherwise, `yyds-lock` prints one message to `sys.stderr` (colored only when stderr is a terminal).
