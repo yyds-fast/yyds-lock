@@ -720,7 +720,9 @@ def release_single(
                 unlock_error,
             )
         elif _default_logger.hasHandlers():
-            _default_logger.warning("Unable to explicitly unlock '%s': %s", lock_path, unlock_error)
+            _default_logger.warning(
+                "Unable to explicitly unlock '%s': %s", lock_path, unlock_error
+            )
 
 
 class SingleInstanceLock:

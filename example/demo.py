@@ -14,10 +14,14 @@ import yyds_lock
 
 try:
     from yyds_logger import YydsLogger
+
     logger = YydsLogger("yyds_demo", log_dir="./logs").logger
 except ImportError:
     import logging
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
+    )
     logger = logging.getLogger("yyds_demo")
 
 
