@@ -242,7 +242,11 @@ def _remove_recorded_path(thread, lock_path):
                 return
 
 
-def _conflict_message():
+def _conflict_message(lock_name=None):
+    if lock_name:
+        return "[yyds-lock] 错误: 锁 '{}' 已被占用（已有实例在运行），当前实例自动退出！".format(
+            lock_name
+        )
     return "[yyds-lock] 错误: 脚本进程已在运行中，当前实例自动退出！"
 
 
@@ -278,7 +282,7 @@ def _handle_conflict(
             raise error from cause
         raise error
 
-    message = _conflict_message()
+    message = _conflict_message(lock_name=lock_name)
     if custom_logger is not None:
         _emit_log(custom_logger, "error", message)
     elif _default_logger.hasHandlers():

@@ -1088,7 +1088,7 @@ with tempfile.TemporaryDirectory() as directory:
         self.assertEqual(errors, [1])
         self.assertTrue(mock_handler.handle.called)
         record = mock_handler.handle.call_args[0][0]
-        self.assertIn("[yyds-lock] 错误: 脚本进程已在运行中，当前实例自动退出！", record.getMessage())
+        self.assertIn("custom_logger.lock' 已被占用（已有实例在运行），当前实例自动退出！", record.getMessage())
         self.assertEqual(record.levelno, logging.ERROR)
 
     def test_custom_duck_typed_logger_receives_conflict_log(self):
