@@ -144,6 +144,7 @@ class TestYYDSLock(unittest.TestCase):
             self.assertEqual(proc_try.returncode, 1)
             # A non-UTF-8 Windows pipe may backslash-escape the Chinese text.
             self.assertIn("[yyds-lock]", proc_try.stderr)
+            self.assertIn(f"PID: {proc_hold.pid}", proc_try.stderr)
             self.assertNotIn("ACQUIRED", proc_try.stdout)
         finally:
             if proc_hold.poll() is None:
@@ -699,7 +700,7 @@ with tempfile.TemporaryDirectory() as directory:
             release_single(lock_path)
 
         self.assertEqual(errors, [1])
-        self.assertEqual(stderr.getvalue().count("[yyds-lock] 错误"), 1)
+        self.assertEqual(stderr.getvalue().count("[yyds-lock] Failed to acquire lock"), 1)
         self.assertNotIn("\033", stderr.getvalue())
 
     def test_non_conflict_os_error_is_not_reported_as_locked(self):
@@ -1089,9 +1090,10 @@ with tempfile.TemporaryDirectory() as directory:
         self.assertTrue(mock_handler.handle.called)
         record = mock_handler.handle.call_args[0][0]
         self.assertIn(
-            "custom_logger.lock' 已被占用（已有实例在运行），当前实例自动退出！",
+            "custom_logger.lock' is already held by execution owner",
             record.getMessage(),
         )
+        self.assertIn("[yyds-lock] Failed to acquire lock", record.getMessage())
         self.assertEqual(record.levelno, logging.ERROR)
 
     def test_custom_duck_typed_logger_receives_conflict_log(self):
@@ -1125,7 +1127,7 @@ with tempfile.TemporaryDirectory() as directory:
 
         self.assertEqual(errors, [1])
         self.assertEqual(len(custom_logger.messages), 1)
-        self.assertIn("[yyds-lock] 错误", custom_logger.messages[0])
+        self.assertIn("[yyds-lock] Failed to acquire lock", custom_logger.messages[0])
 
     def test_custom_callable_logger_receives_conflict_log(self):
         import tempfile
@@ -1154,7 +1156,7 @@ with tempfile.TemporaryDirectory() as directory:
 
         self.assertEqual(errors, [1])
         self.assertEqual(len(logs), 1)
-        self.assertIn("[yyds-lock] 错误", logs[0])
+        self.assertIn("[yyds-lock] Failed to acquire lock", logs[0])
 
     def test_single_instance_lock_and_decorator_with_logger(self):
         import tempfile
@@ -1186,7 +1188,7 @@ with tempfile.TemporaryDirectory() as directory:
 
             self.assertEqual(errors, [1])
             self.assertEqual(len(logs), 1)
-            self.assertIn("[yyds-lock] 错误", logs[0])
+            self.assertIn("[yyds-lock] Failed to acquire lock", logs[0])
 
             @single_decorator(lock_name=lock_path, block=False, logger=logger_inst)
             def protected_func():
@@ -1207,7 +1209,7 @@ with tempfile.TemporaryDirectory() as directory:
 
             self.assertEqual(errors, [1])
             self.assertEqual(len(logs), 1)
-            self.assertIn("[yyds-lock] 错误", logs[0])
+            self.assertIn("[yyds-lock] Failed to acquire lock", logs[0])
 
             release_single(lock_path)
 

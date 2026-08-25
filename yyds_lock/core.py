@@ -242,12 +242,49 @@ def _remove_recorded_path(thread, lock_path):
                 return
 
 
-def _conflict_message(lock_name=None):
-    if lock_name:
-        return "[yyds-lock] 错误: 锁 '{}' 已被占用（已有实例在运行），当前实例自动退出！".format(
-            lock_name
+def _write_lock_metadata(handle):
+    try:
+        handle.seek(0)
+        payload = "{}\n".format(os.getpid()).encode("utf-8")
+        handle.write(payload)
+        handle.truncate()
+        handle.flush()
+    except Exception:
+        pass
+
+
+def _read_lock_pid(lock_path):
+    try:
+        with open(lock_path, "rb") as f:
+            content = f.read(64).decode("utf-8", "ignore").strip()
+            if content:
+                first_line = content.splitlines()[0].strip()
+                if first_line.isdigit():
+                    return int(first_line)
+    except Exception:
+        pass
+    return None
+
+
+def _conflict_message(
+    lock_name=None,
+    owner_pid=None,
+    current_pid=None,
+    owner_thread=None,
+):
+    current_pid = current_pid or os.getpid()
+    prefix = "Lock '{}'".format(lock_name) if lock_name else "Lock"
+    if owner_pid is not None:
+        return "[yyds-lock] Failed to acquire lock: {} is already held by process (PID: {}). Current process (PID: {}) exiting.".format(
+            prefix, owner_pid, current_pid
         )
-    return "[yyds-lock] 错误: 脚本进程已在运行中，当前实例自动退出！"
+    if owner_thread is not None:
+        return "[yyds-lock] Failed to acquire lock: {} is already held by execution owner [{}] in this process. Current instance exiting.".format(
+            prefix, owner_thread
+        )
+    return "[yyds-lock] Failed to acquire lock: {} is already held by another process. Current process (PID: {}) exiting.".format(
+        prefix, current_pid
+    )
 
 
 def _emit_log(custom_logger, level: str, message: str, *args, **kwargs):
@@ -275,6 +312,9 @@ def _handle_conflict(
     detail,
     cause=None,
     custom_logger=None,
+    owner_pid=None,
+    owner_thread=None,
+    current_pid=None,
 ):
     if raise_on_conflict:
         error = AlreadyLockedError(detail)
@@ -282,7 +322,12 @@ def _handle_conflict(
             raise error from cause
         raise error
 
-    message = _conflict_message(lock_name=lock_name)
+    message = _conflict_message(
+        lock_name=lock_name,
+        owner_pid=owner_pid,
+        current_pid=current_pid,
+        owner_thread=owner_thread,
+    )
     if custom_logger is not None:
         _emit_log(custom_logger, "error", message)
     elif _default_logger.hasHandlers():
@@ -534,6 +579,7 @@ def force_single(
                     lock_name, owner
                 ),
                 custom_logger=logger,
+                owner_thread=owner,
             )
 
         activity_event = claim_data
@@ -560,6 +606,7 @@ def force_single(
             _discard_pending_handle(handle)
             _finish_path_activity(lock_path, activity_event)
             if _is_lock_conflict(exc):
+                owner_pid = _read_lock_pid(lock_path)
                 _handle_conflict(
                     lock_name,
                     raise_on_conflict,
@@ -568,12 +615,15 @@ def force_single(
                     ),
                     cause=exc,
                     custom_logger=logger,
+                    owner_pid=owner_pid,
                 )
             raise _operation_error("acquire", lock_path, exc) from exc
         except BaseException:
             _discard_pending_handle(handle)
             _finish_path_activity(lock_path, activity_event)
             raise
+
+        _write_lock_metadata(handle)
 
         lock_info = {
             "handle": handle,
