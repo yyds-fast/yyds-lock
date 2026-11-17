@@ -1299,9 +1299,7 @@ with tempfile.TemporaryDirectory() as directory:
                 await entered.wait()
 
                 async def waiter():
-                    await force_single_async(
-                        lock_path, timeout=1.0, poll_interval=0.5
-                    )
+                    await force_single_async(lock_path, timeout=1.0, poll_interval=0.5)
                     release_single(lock_path)
                     return "acquired"
 
@@ -1347,7 +1345,9 @@ with tempfile.TemporaryDirectory() as directory:
             force_single(lock_path, raise_on_conflict=True)
             release_single(lock_path)
 
-    def test_async_generator_decorator_supports_asend_athrow_and_cross_task_aclose(self):
+    def test_async_generator_decorator_supports_asend_athrow_and_cross_task_aclose(
+        self,
+    ):
         import asyncio
         import gc
         import tempfile
@@ -1365,19 +1365,24 @@ with tempfile.TemporaryDirectory() as directory:
                     yield f"caught:{exc}"
 
             async def scenario():
+                canonical_path = os.path.realpath(lock_path)
                 g = agen()
                 self.assertEqual(await g.__anext__(), "start")
                 self.assertEqual(await g.asend("payload"), "sent:payload")
                 self.assertEqual(await g.athrow(ValueError("oops")), "caught:oops")
                 with self.assertRaises(StopAsyncIteration):
                     await g.__anext__()
-                self.assertNotIn(lock_path, core._lock_file_handles)
+                self.assertNotIn(canonical_path, core._lock_file_handles)
 
                 # Cross-task aclose must release cleanly without RuntimeError.
                 g2 = agen()
                 self.assertEqual(await g2.__anext__(), "start")
-                await asyncio.create_task(g2.aclose())
-                self.assertNotIn(lock_path, core._lock_file_handles)
+
+                async def close_in_other_task():
+                    await g2.aclose()
+
+                await asyncio.create_task(close_in_other_task())
+                self.assertNotIn(canonical_path, core._lock_file_handles)
 
                 # Abandoned unclosed async generator releases on GC finalization.
                 g3 = agen()
@@ -1593,8 +1598,9 @@ with tempfile.TemporaryDirectory() as directory:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             lock_path = os.path.join(tmpdir, "cleanup_events.lock")
+            canonical_path = os.path.realpath(lock_path)
             force_single(lock_path, raise_on_conflict=True)
-            released_event = core._lock_file_handles[lock_path]["released_event"]
+            released_event = core._lock_file_handles[canonical_path]["released_event"]
             self.assertFalse(released_event.is_set())
 
             core._cleanup_all()

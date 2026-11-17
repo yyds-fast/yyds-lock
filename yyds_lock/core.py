@@ -986,7 +986,9 @@ async def force_single_async(
             # the waiter; yield once and retry immediately.
             await asyncio.sleep(0)
         else:
-            delay = poll_interval if remaining is None else min(poll_interval, remaining)
+            delay = (
+                poll_interval if remaining is None else min(poll_interval, remaining)
+            )
             await asyncio.sleep(delay)
 
 
