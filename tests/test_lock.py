@@ -1238,21 +1238,423 @@ with tempfile.TemporaryDirectory() as directory:
                 read_pid = core._read_lock_pid(lock_path)
                 self.assertEqual(read_pid, os.getpid())
 
-            # Test POSIX metadata write and read (offset 0)
+            # Test POSIX metadata write and read (offset 0), including overwriting
+            # stale PID when opened with "a+b" (O_APPEND) as in _open_lock_handle.
             with patch.object(core.os, "name", "posix"):
-                with open(lock_path, "w+b") as handle:
+                with open(lock_path, "wb") as handle:
+                    handle.write(b"99999999\n")
+
+                with open(lock_path, "a+b", buffering=0) as handle:
                     core._write_lock_metadata(handle)
 
                 with open(lock_path, "rb") as handle:
                     data = handle.read()
                     self.assertFalse(data.startswith(b"\x00"))
-                    self.assertTrue(data.startswith(str(os.getpid()).encode("utf-8")))
+                    self.assertEqual(data, f"{os.getpid()}\n".encode("utf-8"))
 
                 read_pid = core._read_lock_pid(lock_path)
                 self.assertEqual(read_pid, os.getpid())
         finally:
             if os.path.exists(lock_path):
                 os.remove(lock_path)
+
+    def test_dead_thread_owner_is_reclaimed_without_deadlock(self):
+        import tempfile
+        from yyds_lock import core
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "dead_thread.lock")
+
+            def worker():
+                force_single(lock_path, raise_on_conflict=True)
+
+            thread = threading.Thread(target=worker)
+            thread.start()
+            thread.join()
+            self.assertFalse(thread.is_alive())
+
+            # Blocking acquire must reclaim the dead thread's lock rather than hang.
+            force_single(lock_path, block=True, raise_on_conflict=True)
+            release_single(lock_path)
+            self.assertFalse(core._lock_file_handles)
+            self.assertFalse(core._thread_acquisitions)
+
+    def test_dead_async_task_owner_is_reclaimed(self):
+        import asyncio
+        import tempfile
+        from yyds_lock import core
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "dead_task.lock")
+
+            async def scenario():
+                entered = asyncio.Event()
+
+                async def crashing_holder():
+                    force_single(lock_path, raise_on_conflict=True)
+                    entered.set()
+                    await asyncio.sleep(5)
+
+                task1 = asyncio.create_task(crashing_holder())
+                await entered.wait()
+
+                async def waiter():
+                    await force_single_async(
+                        lock_path, timeout=1.0, poll_interval=0.5
+                    )
+                    release_single(lock_path)
+                    return "acquired"
+
+                task2 = asyncio.create_task(waiter())
+                await asyncio.sleep(0)
+                task1.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task1
+
+                result = await asyncio.wait_for(task2, timeout=0.5)
+                self.assertEqual(result, "acquired")
+
+            asyncio.run(scenario())
+            self.assertFalse(core._lock_file_handles)
+            self.assertFalse(core._async_waiters)
+            self.assertFalse(core._thread_acquisitions)
+
+    def test_sync_generator_decorator_releases_when_closed_from_another_thread(self):
+        import tempfile
+        from yyds_lock import core
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "gen_cross_thread.lock")
+
+            @single_decorator(lock_name=lock_path, raise_on_conflict=True)
+            def gen():
+                yield "one"
+                yield "two"
+
+            holder = []
+
+            def start_gen():
+                g = gen()
+                self.assertEqual(next(g), "one")
+                holder.append(g)
+
+            thread = threading.Thread(target=start_gen)
+            thread.start()
+            thread.join()
+
+            holder[0].close()
+            self.assertFalse(core._lock_file_handles)
+            force_single(lock_path, raise_on_conflict=True)
+            release_single(lock_path)
+
+    def test_async_generator_decorator_supports_asend_athrow_and_cross_task_aclose(self):
+        import asyncio
+        import gc
+        import tempfile
+        from yyds_lock import core
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "agen_full.lock")
+
+            @single_decorator(lock_name=lock_path, raise_on_conflict=True)
+            async def agen():
+                try:
+                    val = yield "start"
+                    yield f"sent:{val}"
+                except ValueError as exc:
+                    yield f"caught:{exc}"
+
+            async def scenario():
+                g = agen()
+                self.assertEqual(await g.__anext__(), "start")
+                self.assertEqual(await g.asend("payload"), "sent:payload")
+                self.assertEqual(await g.athrow(ValueError("oops")), "caught:oops")
+                with self.assertRaises(StopAsyncIteration):
+                    await g.__anext__()
+                self.assertNotIn(lock_path, core._lock_file_handles)
+
+                # Cross-task aclose must release cleanly without RuntimeError.
+                g2 = agen()
+                self.assertEqual(await g2.__anext__(), "start")
+                await asyncio.create_task(g2.aclose())
+                self.assertNotIn(lock_path, core._lock_file_handles)
+
+                # Abandoned unclosed async generator releases on GC finalization.
+                g3 = agen()
+                self.assertEqual(await g3.__anext__(), "start")
+                del g3
+                gc.collect()
+
+            asyncio.run(scenario())
+            self.assertFalse(core._lock_file_handles)
+
+    def test_open_base_exception_cleans_up_path_activity(self):
+        import tempfile
+        from unittest.mock import patch
+        from yyds_lock import core
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "interrupt.lock")
+
+            with patch.object(
+                core, "_open_lock_handle", side_effect=KeyboardInterrupt()
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    force_single(lock_path, raise_on_conflict=True)
+
+            self.assertFalse(core._path_activity)
+            self.assertFalse(core._pending_handles)
+            force_single(lock_path, raise_on_conflict=True)
+            release_single(lock_path)
+
+    def test_relative_lock_path_respects_working_directory_change(self):
+        import tempfile
+        from yyds_lock import core
+
+        orig_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dir1 = os.path.join(tmpdir, "dir1")
+            dir2 = os.path.join(tmpdir, "dir2")
+            os.makedirs(dir1)
+            os.makedirs(dir2)
+            try:
+                os.chdir(dir1)
+                force_single("sub/rel.lock", raise_on_conflict=True)
+                os.chdir(dir2)
+                force_single("sub/rel.lock", raise_on_conflict=True)
+
+                path1 = os.path.realpath(os.path.join(dir1, "sub/rel.lock"))
+                path2 = os.path.realpath(os.path.join(dir2, "sub/rel.lock"))
+                self.assertTrue(os.path.exists(path1))
+                self.assertTrue(os.path.exists(path2))
+                self.assertIn(path1, core._lock_file_handles)
+                self.assertIn(path2, core._lock_file_handles)
+
+                os.chdir(dir1)
+                release_single("sub/rel.lock")
+                self.assertNotIn(path1, core._lock_file_handles)
+                self.assertIn(path2, core._lock_file_handles)
+
+                os.chdir(dir2)
+                release_single("sub/rel.lock")
+                self.assertFalse(core._lock_file_handles)
+            finally:
+                os.chdir(orig_cwd)
+
+    def test_base_dir_with_relative_subpath_and_invalid_inputs(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            force_single("team/job.lock", base_dir=tmpdir, raise_on_conflict=True)
+            expected = os.path.join(tmpdir, "team", "job.lock")
+            self.assertTrue(os.path.exists(expected))
+            release_single("team/job.lock", base_dir=tmpdir)
+
+            with self.assertRaises(ValueError):
+                force_single(os.path.abspath(expected), base_dir=tmpdir)
+
+            for invalid_name in [".", "..", "dir/", "sub/.", "sub/.."]:
+                with self.assertRaises(ValueError):
+                    force_single(invalid_name)
+
+    def test_callable_logger_formats_unlock_warning_arguments(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stderr
+        from unittest.mock import patch
+        from yyds_lock import core
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "warn_fmt.lock")
+            logs = []
+
+            force_single(lock_path, raise_on_conflict=True)
+            with patch.object(core, "_unlock_os_lock", side_effect=OSError("boom")):
+                release_single(lock_path, logger=lambda msg: logs.append(msg))
+
+            self.assertEqual(len(logs), 1)
+            self.assertIn(lock_path, logs[0])
+            self.assertIn("boom", logs[0])
+            self.assertNotIn("%s", logs[0])
+
+            # Invalid non-callable logger falls back to default logging/stderr.
+            force_single(lock_path, raise_on_conflict=True)
+            stderr = io.StringIO()
+            errors = []
+
+            def contender():
+                try:
+                    force_single(lock_path, block=False, logger=123)
+                except SystemExit as exc:
+                    errors.append(exc.code)
+
+            with patch.object(core.logger, "hasHandlers", return_value=False):
+                with redirect_stderr(stderr):
+                    thread = threading.Thread(target=contender)
+                    thread.start()
+                    thread.join()
+
+            release_single(lock_path)
+            self.assertEqual(errors, [1])
+            self.assertIn("[yyds-lock] Failed to acquire lock", stderr.getvalue())
+
+    def test_single_instance_lock_async_context_manager(self):
+        import asyncio
+        import tempfile
+        from yyds_lock import core
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "async_ctx.lock")
+
+            async def scenario():
+                entered = asyncio.Event()
+                allow_exit = asyncio.Event()
+
+                async def holder():
+                    async with SingleInstanceLock(
+                        lock_path, block=True, timeout=1.0
+                    ) as lock:
+                        self.assertTrue(lock.acquired)
+                        entered.set()
+                        await allow_exit.wait()
+                    self.assertFalse(lock.acquired)
+
+                t1 = asyncio.create_task(holder())
+                await entered.wait()
+
+                with self.assertRaises(AlreadyLockedError):
+                    async with SingleInstanceLock(
+                        lock_path, block=False, raise_on_conflict=True
+                    ):
+                        pass
+
+                async def waiter():
+                    async with SingleInstanceLock(
+                        lock_path, block=True, timeout=1.0, poll_interval=0.5
+                    ) as lock2:
+                        self.assertTrue(lock2.acquired)
+                    self.assertFalse(lock2.acquired)
+                    return True
+
+                t2 = asyncio.create_task(waiter())
+                await asyncio.sleep(0)
+                allow_exit.set()
+                await t1
+                self.assertTrue(await asyncio.wait_for(t2, timeout=0.5))
+
+            asyncio.run(scenario())
+            self.assertFalse(core._lock_file_handles)
+
+    def test_async_wait_wakes_immediately_on_local_release_without_reresolving(self):
+        import asyncio
+        import tempfile
+        from unittest.mock import patch
+        from yyds_lock import core
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            resolve_calls = []
+            orig_resolve = core._resolve_lock_path
+
+            def spy_resolve(*args, **kwargs):
+                resolve_calls.append((args, kwargs))
+                return orig_resolve(*args, **kwargs)
+
+            async def scenario():
+                holder_ready = asyncio.Event()
+
+                async def holder():
+                    force_single("wake.lock", base_dir=tmpdir, raise_on_conflict=True)
+                    holder_ready.set()
+                    await asyncio.sleep(0.02)
+                    release_single("wake.lock", base_dir=tmpdir)
+
+                with patch.object(core, "_resolve_lock_path", side_effect=spy_resolve):
+                    t1 = asyncio.create_task(holder())
+                    await holder_ready.wait()
+                    # Huge poll_interval proves wakeup uses the event, not polling.
+                    t0 = time.monotonic()
+                    await force_single_async(
+                        "wake.lock",
+                        base_dir=tmpdir,
+                        timeout=0.5,
+                        poll_interval=5.0,
+                    )
+                    elapsed = time.monotonic() - t0
+                    release_single("wake.lock", base_dir=tmpdir)
+                    await t1
+                    self.assertLess(elapsed, 0.25)
+
+            asyncio.run(scenario())
+            self.assertEqual(len(resolve_calls), 2)
+
+    def test_cleanup_all_wakes_released_events_and_handles(self):
+        import tempfile
+        from yyds_lock import core
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "cleanup_events.lock")
+            force_single(lock_path, raise_on_conflict=True)
+            released_event = core._lock_file_handles[lock_path]["released_event"]
+            self.assertFalse(released_event.is_set())
+
+            core._cleanup_all()
+            self.assertTrue(released_event.is_set())
+            self.assertFalse(core._lock_file_handles)
+            self.assertFalse(core._pending_handles)
+            self.assertFalse(core._path_activity)
+            self.assertFalse(core._thread_acquisitions)
+
+    def test_windows_prepare_lock_byte_retries_inside_block_loop(self):
+        import tempfile
+        import types
+        from unittest.mock import patch
+        from yyds_lock import core
+
+        attempts = {"tell": 0, "lock": 0}
+        fake_msvcrt = types.SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2)
+
+        def locking(fd, mode, size):
+            attempts["lock"] += 1
+
+        fake_msvcrt.locking = locking
+
+        class FakeHandle:
+            def __init__(self, real_handle):
+                self._real = real_handle
+                self.writes = 0
+
+            def fileno(self):
+                return self._real.fileno()
+
+            def seek(self, offset, whence=0):
+                return self._real.seek(offset, whence)
+
+            def tell(self):
+                attempts["tell"] += 1
+                return self._real.tell()
+
+            def write(self, data):
+                if self.writes == 0:
+                    self.writes += 1
+                    err = OSError(13, "locked")
+                    err.winerror = 33
+                    raise err
+                return self._real.write(data)
+
+            def flush(self):
+                return self._real.flush()
+
+        with tempfile.TemporaryFile(mode="w+b") as raw_handle:
+            fake_handle = FakeHandle(raw_handle)
+            with patch.object(core.os, "name", "nt"):
+                with patch.dict(sys.modules, {"msvcrt": fake_msvcrt}):
+                    with patch.object(core.time, "sleep") as sleeper:
+                        core._acquire_os_lock(fake_handle, block=True)
+
+            self.assertEqual(sleeper.call_count, 1)
+            self.assertEqual(attempts["lock"], 1)
+            raw_handle.seek(0, os.SEEK_END)
+            self.assertEqual(raw_handle.tell(), 1)
 
 
 if __name__ == "__main__":

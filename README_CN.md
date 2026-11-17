@@ -96,13 +96,17 @@ except AlreadyLockedError:
 
 ### 姿势 D：上下文管理器
 
-需要明确控制锁的代码作用域时，可以使用 `SingleInstanceLock`：
+需要明确控制锁的代码作用域时，可以使用 `SingleInstanceLock`（同时支持同步 `with` 与异步 `async with`）：
 
 ```python
 from yyds_lock import SingleInstanceLock
 
 with SingleInstanceLock("my_task.lock", raise_on_conflict=True):
     run_task()
+
+# 在异步上下文中支持 block=True / timeout 排队等待：
+# async with SingleInstanceLock("my_task.lock", block=True, timeout=10):
+#     await run_async_task()
 ```
 
 装饰器也会在 coroutine、generator 和 async generator 的完整执行周期内持锁；异步装饰器可以安全使用 `block=True`，不会阻塞事件循环。
@@ -144,7 +148,7 @@ async def run_job():
 - `raise_on_conflict` (bool)：
   - `False`（默认值）：锁被占用时，直接向日志系统或 stderr 输出错误并以退出码 `1` 退出进程。
   - `True`：锁被占用时，抛出 `AlreadyLockedError` 异常，允许调用者捕获并进行自定义处理。
-- `base_dir` (str 或 `os.PathLike`, 可选)：覆盖裸文件名默认使用的 `~/.yyds_lock`。显式目录不可用时抛出 `LockOperationError`，不会静默降级。
+- `base_dir` (str 或 `os.PathLike`, 可选)：覆盖裸文件名和相对路径默认使用的基准目录（裸文件名默认为 `~/.yyds_lock`）。不可与绝对路径 `lock_name` 同时使用；显式目录不可用时抛出 `LockOperationError`，不会静默降级。
 - `logger` (可选)：传入已初始化好的 Logger 对象（如 `yyds-logger`、标准库 `logging.Logger`、`loguru` 或自定义包装器）。当发生冲突或错误时，直接通过该 logger 记录日志。
 
 `force_single_async` 接受 `lock_name`、`base_dir`、`logger`，以及：
@@ -201,4 +205,6 @@ logger = logging.getLogger("yyds_lock")
 - 文件锁是建议性的，所有参与者必须使用同一规范化路径并主动配合加锁。
 - 互斥范围仅覆盖共享同一底层文件系统的进程。不同主机、文件系统隔离的容器或各自的临时目录需要分布式锁。
 - 网络文件系统对 `flock` 的实现可能不同，关键任务上线前应验证实际挂载环境。
+- 为避免跨进程 `flock` 的 inode 竞争，库本身不会在释放锁时删除 `.lock` 文件；若使用高基数动态锁名（如按每次任务/请求 UUID 生成），需注意定期清理或控制锁名基数。
+- 异步锁的所有权绑定在当前 `asyncio.Task` 上；在已持锁的协程内通过 `asyncio.wait_for(...)` 等会派生新子 `Task` 的 API 再次请求同一锁时，会按不同所有者触发冲突或等待超时。
 - `sys.exit(1)` 本质是在调用上下文抛出 `SystemExit`；在库代码和工作线程中通常更适合设置 `raise_on_conflict=True`。

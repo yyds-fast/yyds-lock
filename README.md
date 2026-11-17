@@ -94,13 +94,17 @@ Operational failures such as permission errors or unsupported filesystem locking
 
 ### Pattern D: Context Manager
 
-Use `SingleInstanceLock` when the lock should have an explicit lexical lifetime:
+Use `SingleInstanceLock` when the lock should have an explicit lexical lifetime (supports both `with` and `async with`):
 
 ```python
 from yyds_lock import SingleInstanceLock
 
 with SingleInstanceLock("my_task.lock", raise_on_conflict=True):
     run_task()
+
+# In async code, block=True and timeout can be used with async with:
+# async with SingleInstanceLock("my_task.lock", block=True, timeout=10):
+#     await run_async_task()
 ```
 
 The decorator also preserves the lock for the full lifetime of coroutine, generator, and async-generator functions. Asynchronous decorators safely support `block=True` without blocking the event loop.
@@ -142,7 +146,7 @@ Do not acquire in an executor and release from the event-loop Task: lock ownersh
 - `raise_on_conflict` (bool):
   - `False` (default): Immediately log an error and call `sys.exit(1)` when the lock is already held.
   - `True`: Raise `AlreadyLockedError` when the lock is already held, allowing the caller to catch it.
-- `base_dir` (str or `os.PathLike`, optional): Overrides the default folder (`~/.yyds_lock`) for simple filenames. Failure to use an explicit directory raises `LockOperationError`; it is not silently replaced.
+- `base_dir` (str or `os.PathLike`, optional): Overrides the default base folder (`~/.yyds_lock`) for simple filenames and relative paths. Cannot be combined with an absolute `lock_name`; failure to use an explicit directory raises `LockOperationError` without silently falling back.
 - `logger` (optional): Pass an already initialized Logger instance (such as `yyds-logger`, standard library `logging.Logger`, `loguru`, or a custom wrapper). When a conflict or error occurs, messages are emitted directly to this logger.
 
 `force_single_async` accepts `lock_name`, `base_dir`, `logger`, plus:
@@ -199,4 +203,6 @@ If an effective handler is configured, conflicts are emitted once through loggin
 - Locks are advisory: every participant must cooperate by locking the same canonical file path.
 - Mutual exclusion is local to processes that share the same underlying filesystem. Separate containers, hosts, or non-shared temporary directories require a distributed lock instead.
 - Network filesystems may implement `flock` differently; validate the target filesystem before relying on it for critical coordination.
+- To avoid cross-process `flock` unlink/inode races, lock files are intentionally not deleted on release; if you use high-cardinality dynamic lock names (e.g., per-request UUIDs), periodically prune unused files or bound lock-name cardinality.
+- Async lock ownership is bound to the current `asyncio.Task`; calling APIs that spawn a child `Task` (such as `asyncio.wait_for(...)`) to acquire the same lock inside an already-locked coroutine treats the child task as a separate contender.
 - `sys.exit(1)` raises `SystemExit` in the calling execution context. In libraries and worker threads, `raise_on_conflict=True` is usually the safer integration mode.
