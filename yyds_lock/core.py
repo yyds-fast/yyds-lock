@@ -174,7 +174,7 @@ def _resolve_lock_path(
     if base_dir is not None:
         base_dir = _coerce_path(base_dir, "base_dir")
         drive, _ = os.path.splitdrive(lock_name)
-        if drive or os.path.isabs(lock_name):
+        if drive or os.path.isabs(lock_name) or lock_name.startswith(("/", "\\")):
             raise ValueError("base_dir cannot be used with an absolute lock_name")
         target_dir = os.path.abspath(base_dir)
         if _prepare:
@@ -943,7 +943,11 @@ async def force_single_async(
 
         if wait_entry is not None:
             done_cb = None
-            if callable(getattr(local_owner, "add_done_callback", None)):
+            same_loop_owner = (
+                callable(getattr(local_owner, "add_done_callback", None))
+                and getattr(local_owner, "get_loop", lambda: None)() is loop
+            )
+            if same_loop_owner:
 
                 def _on_owner_done(_task, _loop=loop, _event=wake_event):
                     _wake_single_async_waiter(_loop, _event)
@@ -955,9 +959,10 @@ async def force_single_async(
                     done_cb = None
 
             try:
-                # If a live Thread holds the lock, periodically re-check in case
-                # that thread exits abruptly without calling release_single().
-                if isinstance(local_owner, threading.Thread):
+                # If a Thread or foreign event loop Task holds the lock,
+                # periodically re-check in case that owner exits abruptly
+                # without calling release_single().
+                if not same_loop_owner:
                     step = 0.2 if remaining is None else min(0.2, remaining)
                 else:
                     step = remaining
@@ -1023,7 +1028,7 @@ def _release_single_for_owner(
 
     if lock_path is None:
         try:
-            lock_path = _resolve_lock_path(lock_name, base_dir)
+            lock_path = _resolve_lock_path(lock_name, base_dir, _prepare=False)
         except OSError:
             return
 

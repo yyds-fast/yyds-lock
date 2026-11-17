@@ -1662,6 +1662,109 @@ with tempfile.TemporaryDirectory() as directory:
             raw_handle.seek(0, os.SEEK_END)
             self.assertEqual(raw_handle.tell(), 1)
 
+    def test_cross_thread_async_loops_do_not_attach_foreign_task_callbacks(self):
+        import asyncio
+        import tempfile
+        from yyds_lock import core
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "cross_loop.lock")
+            cb_threads = []
+            holder_acquired = threading.Event()
+            release_holder = threading.Event()
+
+            class TrackedTask(asyncio.Task):
+                def add_done_callback(self, *args, **kwargs):
+                    cb_threads.append(threading.current_thread())
+                    return super().add_done_callback(*args, **kwargs)
+
+            def run_holder(drop_without_release):
+                loop = asyncio.new_event_loop()
+                loop.set_task_factory(
+                    lambda ev_loop, coro: TrackedTask(coro, loop=ev_loop)
+                )
+
+                async def holder():
+                    force_single(lock_path, raise_on_conflict=True)
+                    holder_acquired.set()
+                    while not release_holder.is_set():
+                        await asyncio.sleep(0.01)
+                    if not drop_without_release:
+                        release_single(lock_path)
+
+                try:
+                    loop.run_until_complete(holder())
+                finally:
+                    loop.close()
+
+            # Case 1: normal cross-loop release wakes foreign waiter immediately.
+            t1 = threading.Thread(target=run_holder, args=(False,))
+            t1.start()
+            self.assertTrue(holder_acquired.wait(timeout=2))
+
+            async def waiter():
+                await force_single_async(lock_path, timeout=1.0, poll_interval=5.0)
+                release_single(lock_path)
+
+            waiter_errors = []
+
+            def run_waiter():
+                try:
+                    asyncio.run(waiter())
+                except Exception as exc:
+                    waiter_errors.append(exc)
+
+            t2 = threading.Thread(target=run_waiter)
+            t2.start()
+            time.sleep(0.05)
+            release_holder.set()
+            t1.join(timeout=2)
+            t2.join(timeout=2)
+            self.assertFalse(waiter_errors)
+            self.assertTrue(all(th is t1 for th in cb_threads))
+
+            # Case 2: foreign-loop task exits without releasing; waiter still reclaims.
+            cb_threads.clear()
+            holder_acquired.clear()
+            release_holder.clear()
+            t3 = threading.Thread(target=run_holder, args=(True,))
+            t3.start()
+            self.assertTrue(holder_acquired.wait(timeout=2))
+
+            t4 = threading.Thread(target=run_waiter)
+            t4.start()
+            time.sleep(0.05)
+            release_holder.set()
+            t3.join(timeout=2)
+            t4.join(timeout=2)
+            self.assertFalse(waiter_errors)
+            self.assertTrue(all(th is t3 for th in cb_threads))
+            self.assertFalse(core._lock_file_handles)
+            self.assertFalse(core._async_waiters)
+
+    def test_base_dir_rejects_leading_separator_paths(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for bad_name in ["/leading.lock", "\\leading.lock"]:
+                with self.assertRaises(ValueError):
+                    force_single(bad_name, base_dir=tmpdir, raise_on_conflict=True)
+
+    def test_release_unheld_lock_does_not_create_lock_directory(self):
+        import tempfile
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing_base = os.path.join(tmpdir, "should_not_exist")
+            release_single("never_held.lock", base_dir=missing_base)
+            self.assertFalse(os.path.exists(missing_base))
+
+            fake_home = os.path.join(tmpdir, "fake_home")
+            os.makedirs(fake_home)
+            with patch.dict(os.environ, {"HOME": fake_home, "USERPROFILE": fake_home}):
+                release_single("never_held.lock")
+            self.assertFalse(os.path.exists(os.path.join(fake_home, ".yyds_lock")))
+
 
 if __name__ == "__main__":
     unittest.main()
