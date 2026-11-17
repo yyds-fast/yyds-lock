@@ -1478,7 +1478,7 @@ with tempfile.TemporaryDirectory() as directory:
                 release_single(lock_path, logger=lambda msg: logs.append(msg))
 
             self.assertEqual(len(logs), 1)
-            self.assertIn(lock_path, logs[0])
+            self.assertIn(os.path.realpath(lock_path), logs[0])
             self.assertIn("boom", logs[0])
             self.assertNotIn("%s", logs[0])
 
