@@ -2,6 +2,7 @@
 
 import atexit
 import asyncio
+from collections import deque
 import errno
 import getpass
 import hashlib
@@ -15,7 +16,6 @@ import tempfile
 import threading
 import time
 import weakref
-from contextlib import contextmanager
 from functools import wraps
 from typing import Any, Optional, Union
 
@@ -40,10 +40,136 @@ class LockOperationError(YYDSLockError):
     """Raised when a lock file or operating-system lock operation fails."""
 
 
+class _ForkReadWriteGate:
+    """Shared-read / exclusive-write gate coordinating open()+registry vs fork().
+
+    Normal lock operations take shared read access so slow filesystem opens on
+    one path never block other threads operating on unrelated locks; only
+    ``os.fork()`` takes exclusive write access to snapshot a quiescent state.
+    """
+
+    __slots__ = (
+        "_lock",
+        "_cond",
+        "_readers",
+        "_writer_thread",
+        "_writer_depth",
+        "_writers_waiting",
+    )
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._readers = {}
+        self._writer_thread = None
+        self._writer_depth = 0
+        self._writers_waiting = 0
+
+    def __enter__(self):
+        ident = threading.get_ident()
+        lock = self._lock
+        lock.acquire()
+        try:
+            if self._writer_thread is None and self._writers_waiting == 0:
+                self._readers[ident] = self._readers.get(ident, 0) + 1
+                return self
+            depth = self._readers.get(ident, 0)
+            if depth > 0 or self._writer_thread == ident:
+                self._readers[ident] = depth + 1
+                return self
+            while self._writer_thread is not None or self._writers_waiting > 0:
+                self._cond.wait()
+            self._readers[ident] = 1
+            return self
+        finally:
+            lock.release()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        ident = threading.get_ident()
+        lock = self._lock
+        lock.acquire()
+        try:
+            new_depth = self._readers[ident] - 1
+            if new_depth > 0:
+                self._readers[ident] = new_depth
+            else:
+                del self._readers[ident]
+                if not self._readers and self._writers_waiting > 0:
+                    self._cond.notify_all()
+        finally:
+            lock.release()
+
+    def read_guard(self):
+        return self
+
+    def current_thread_active(self):
+        ident = threading.get_ident()
+        with self._lock:
+            return ident in self._readers or self._writer_thread == ident
+
+    def write_acquire(self):
+        ident = threading.get_ident()
+        with self._cond:
+            if self._writer_thread == ident:
+                self._writer_depth += 1
+                return
+            self._writers_waiting += 1
+            try:
+                while self._writer_thread is not None or (
+                    len(self._readers) > (1 if ident in self._readers else 0)
+                ):
+                    self._cond.wait()
+                self._writer_thread = ident
+                self._writer_depth = 1
+            finally:
+                self._writers_waiting -= 1
+
+    def write_release(self):
+        with self._cond:
+            self._writer_depth -= 1
+            if self._writer_depth == 0:
+                self._writer_thread = None
+                self._cond.notify_all()
+
+
+class _OwnerKey:
+    """Weakly-referenced execution owner wrapper so dead owners do not leak."""
+
+    __slots__ = ("_ref", "_strong", "_hash")
+
+    def __init__(self, owner, on_collect=None):
+        self._hash = hash(id(owner))
+        try:
+            self._ref = (
+                weakref.ref(owner, on_collect)
+                if on_collect is not None
+                else weakref.ref(owner)
+            )
+            self._strong = None
+        except TypeError:
+            self._ref = None
+            self._strong = owner
+
+    def resolve(self):
+        return self._strong if self._ref is None else self._ref()
+
+    def __hash__(self):
+        return self._hash
+
+    def __eq__(self, other):
+        if self is other:
+            return True
+        if not isinstance(other, _OwnerKey) or self._hash != other._hash:
+            return False
+        left = self.resolve()
+        right = other.resolve()
+        return left is not None and left is right
+
+
 # Every access to the registries below goes through _registry_guard.  The
 # outer fork gate lets the pre-fork callback wait for registry mutations to
 # finish without ever taking an inherited threading lock in the child.
-_fork_gate = threading.RLock()
+_fork_gate = _ForkReadWriteGate()
 _registry_lock = threading.Lock()
 
 # Canonical path -> acquired lock information.
@@ -54,31 +180,64 @@ _lock_file_handles = {}
 # child forked at any point can close every inherited descriptor safely.
 _pending_handles = set()
 
-# Canonical path -> Event.  A path is present while a local thread is acquiring
-# or releasing it.  This prevents platform-specific file-lock semantics from
-# allowing two threads in one process to overwrite each other's registry data.
+# Canonical path -> (Event, owner_identifier).  A path is present while a local
+# thread is acquiring or releasing it.
 _path_activity = {}
 
-# Canonical path -> set of (event_loop, asyncio.Event) waiting for local
-# ownership/activity on the path to clear.
+# Canonical path -> FIFO deque of threading.Event for blocked sync threads.
+_sync_waiters = {}
+
+# Canonical path -> FIFO deque of (event_loop, asyncio.Event) waiting for local
+# ownership/activity or the cross-process poll leader to finish.
 _async_waiters = {}
 
-# Execution owner (Thread or asyncio Task) -> logical lock key -> acquisition
-# paths.  Recording the path chosen at acquire time means release_single does
-# not have to repeat fallback decisions after permissions or the working
-# directory change.
+# Canonical path -> active leader poll_interval for single-flight cross-process
+# async polling.
+_async_poll_leaders = {}
+
+# _OwnerKey -> logical lock key -> acquisition paths.
 _thread_acquisitions = {}
+
+# Lock-free queues populated by weakref / task-done callbacks so dead owners
+# have their FDs and bookkeeping reclaimed even if their lock path is never
+# requested again.
+_stale_lock_paths = deque()
+_dead_owner_keys = deque()
+_acquire_op_counter = 0
+
+# Cached canonical directory info for default bare lock names:
+# (raw_target_dir, st_dev, st_ino) -> canonical_dir_path
+_default_dir_cache = {}
 
 # Live SingleInstanceLock instances so fork child cleanup can reset them
 # atomically before any child thread can race on them.
 _live_lock_instances = weakref.WeakSet()
 
 
-@contextmanager
+class _RegistryGuard:
+    __slots__ = ()
+
+    def __enter__(self):
+        _fork_gate.__enter__()
+        try:
+            _registry_lock.acquire()
+        except BaseException:
+            _fork_gate.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            _registry_lock.release()
+        finally:
+            _fork_gate.__exit__(exc_type, exc_val, exc_tb)
+
+
+_REGISTRY_GUARD = _RegistryGuard()
+
+
 def _registry_guard():
-    with _fork_gate:
-        with _registry_lock:
-            yield
+    return _REGISTRY_GUARD
 
 
 def _coerce_path(value, parameter):
@@ -131,14 +290,18 @@ def _temp_lock_dir():
 
 
 def _prepare_directory(directory):
-    os.makedirs(directory, mode=0o700, exist_ok=True)
+    if not os.path.isdir(directory):
+        os.makedirs(directory, mode=0o700, exist_ok=True)
 
 
-def _prepare_private_directory(directory):
+def _prepare_private_directory(directory, _return_stat=False):
     """Create and validate a library-owned per-user lock directory."""
-    _prepare_directory(directory)
     if os.name != "nt" and hasattr(os, "getuid"):
-        directory_stat = os.lstat(directory)
+        try:
+            directory_stat = os.lstat(directory)
+        except FileNotFoundError:
+            _prepare_directory(directory)
+            directory_stat = os.lstat(directory)
         if (
             not stat.S_ISDIR(directory_stat.st_mode)
             or directory_stat.st_uid != os.getuid()
@@ -148,14 +311,49 @@ def _prepare_private_directory(directory):
                 "lock directory is not owned by the current user",
                 directory,
             )
-        if stat.S_IMODE(directory_stat.st_mode) & 0o077:
+        if stat.S_IMODE(directory_stat.st_mode) != 0o700:
             os.chmod(directory, 0o700)
-    return directory
+        return (directory, directory_stat) if _return_stat else directory
+
+    _prepare_directory(directory)
+    return (directory, None) if _return_stat else directory
 
 
-def _prepare_temp_directory():
+def _prepare_temp_directory(_return_stat=False):
     directory = _temp_lock_dir()
-    return _prepare_private_directory(directory)
+    return _prepare_private_directory(directory, _return_stat=_return_stat)
+
+
+def _canonicalize_bare_join(target_dir, lock_name, dir_stat=None):
+    """Join a prepared bare-lock directory and filename with minimal syscalls."""
+    if dir_stat is None:
+        try:
+            dir_stat = os.lstat(target_dir)
+        except OSError:
+            return os.path.realpath(
+                os.path.abspath(os.path.join(target_dir, lock_name))
+            )
+
+    if stat.S_ISDIR(dir_stat.st_mode):
+        cache_key = (target_dir, dir_stat.st_dev, dir_stat.st_ino)
+        canonical_dir = _default_dir_cache.get(cache_key)
+        if canonical_dir is None:
+            canonical_dir = os.path.realpath(os.path.abspath(target_dir))
+            if len(_default_dir_cache) > 16:
+                _default_dir_cache.clear()
+            _default_dir_cache[cache_key] = canonical_dir
+
+        joined = os.path.join(canonical_dir, lock_name)
+        try:
+            file_stat = os.lstat(joined)
+        except OSError:
+            # File does not exist yet; canonical_dir has no symlinks and
+            # lock_name is a bare filename without separators.
+            return joined
+        if not stat.S_ISLNK(file_stat.st_mode) and os.name != "nt":
+            return joined
+
+    return os.path.realpath(os.path.abspath(os.path.join(target_dir, lock_name)))
 
 
 def _resolve_lock_path(
@@ -188,17 +386,23 @@ def _resolve_lock_path(
     home_is_usable = bool(
         home and home != "~" and os.path.isdir(home) and os.access(home, os.W_OK)
     )
+    dir_stat = None
     if home_is_usable:
         target_dir = os.path.join(home, ".yyds_lock")
         if _prepare:
             try:
-                _prepare_private_directory(target_dir)
+                target_dir, dir_stat = _prepare_private_directory(
+                    target_dir, _return_stat=True
+                )
             except OSError:
-                target_dir = _prepare_temp_directory()
+                target_dir, dir_stat = _prepare_temp_directory(_return_stat=True)
     else:
-        target_dir = _prepare_temp_directory() if _prepare else _temp_lock_dir()
+        if _prepare:
+            target_dir, dir_stat = _prepare_temp_directory(_return_stat=True)
+        else:
+            target_dir = _temp_lock_dir()
 
-    return os.path.realpath(os.path.abspath(os.path.join(target_dir, lock_name)))
+    return _canonicalize_bare_join(target_dir, lock_name, dir_stat=dir_stat)
 
 
 def _logical_lock_key(lock_name, base_dir):
@@ -221,6 +425,8 @@ def _current_owner():
 
 
 def _is_owner_alive(owner):
+    if owner is None:
+        return False
     if isinstance(owner, threading.Thread):
         return owner.is_alive()
     done_fn = getattr(owner, "done", None)
@@ -230,6 +436,13 @@ def _is_owner_alive(owner):
     if callable(is_alive_fn):
         return bool(is_alive_fn())
     return True
+
+
+def _resolve_info_owner(info):
+    owner_ref = info.get("owner_ref")
+    if owner_ref is not None:
+        return owner_ref.resolve()
+    return info.get("owner_thread")
 
 
 def _owner_identifier(owner):
@@ -242,18 +455,30 @@ def _owner_identifier(owner):
     return "async-task-{}".format(id(owner))
 
 
-def _record_acquisition(thread, logical_key, lock_path):
-    by_key = _thread_acquisitions.setdefault(thread, {})
+def _record_acquisition(owner, logical_key, lock_path):
+    probe = _OwnerKey(owner)
+    by_key = _thread_acquisitions.get(probe)
+    if by_key is None:
+
+        def _on_key_collect(_ref, _key_holder=[]):
+            if _key_holder:
+                _dead_owner_keys.append(_key_holder[0])
+
+        tracked_key = _OwnerKey(owner, on_collect=_on_key_collect)
+        _on_key_collect.__defaults__[0].append(tracked_key)
+        by_key = {}
+        _thread_acquisitions[tracked_key] = by_key
     by_key.setdefault(logical_key, []).append(lock_path)
 
 
-def _peek_recorded_path(thread, logical_key):
-    paths = _thread_acquisitions.get(thread, {}).get(logical_key)
+def _peek_recorded_path(owner, logical_key):
+    paths = _thread_acquisitions.get(_OwnerKey(owner), {}).get(logical_key)
     return paths[-1] if paths else None
 
 
-def _pop_recorded_path(thread, logical_key):
-    by_key = _thread_acquisitions.get(thread)
+def _pop_recorded_path(owner, logical_key):
+    probe = _OwnerKey(owner)
+    by_key = _thread_acquisitions.get(probe)
     if not by_key:
         return None
 
@@ -265,15 +490,28 @@ def _pop_recorded_path(thread, logical_key):
     if not paths:
         by_key.pop(logical_key, None)
     if not by_key:
-        _thread_acquisitions.pop(thread, None)
+        _thread_acquisitions.pop(probe, None)
     return lock_path
 
 
-def _remove_recorded_path(thread, lock_path):
-    """Remove one acquisition when release uses an equivalent path spelling."""
-    by_key = _thread_acquisitions.get(thread)
+def _remove_recorded_path(owner, lock_path, preferred_key=None):
+    """Remove one acquisition matching ``lock_path`` for ``owner``."""
+    probe = _OwnerKey(owner)
+    by_key = _thread_acquisitions.get(probe)
     if not by_key:
         return
+
+    if preferred_key is not None:
+        preferred_paths = by_key.get(preferred_key)
+        if preferred_paths:
+            for index in range(len(preferred_paths) - 1, -1, -1):
+                if preferred_paths[index] == lock_path:
+                    preferred_paths.pop(index)
+                    if not preferred_paths:
+                        by_key.pop(preferred_key, None)
+                    if not by_key:
+                        _thread_acquisitions.pop(probe, None)
+                    return
 
     for logical_key, paths in reversed(list(by_key.items())):
         for index in range(len(paths) - 1, -1, -1):
@@ -282,13 +520,16 @@ def _remove_recorded_path(thread, lock_path):
                 if not paths:
                     by_key.pop(logical_key, None)
                 if not by_key:
-                    _thread_acquisitions.pop(thread, None)
+                    _thread_acquisitions.pop(probe, None)
                 return
 
 
-def _purge_recorded_path(owner, lock_path):
+def _purge_recorded_path(owner_or_key, lock_path):
     """Remove all recorded acquisitions of ``lock_path`` for a dead owner."""
-    by_key = _thread_acquisitions.get(owner)
+    probe = (
+        owner_or_key if isinstance(owner_or_key, _OwnerKey) else _OwnerKey(owner_or_key)
+    )
+    by_key = _thread_acquisitions.get(probe)
     if not by_key:
         return
 
@@ -299,7 +540,7 @@ def _purge_recorded_path(owner, lock_path):
         else:
             by_key.pop(logical_key, None)
     if not by_key:
-        _thread_acquisitions.pop(owner, None)
+        _thread_acquisitions.pop(probe, None)
 
 
 def _write_lock_metadata(handle):
@@ -358,18 +599,24 @@ def _emit_log(custom_logger, level: str, message: str, *args, **kwargs):
         return False
     log_func = getattr(custom_logger, level, None)
     if callable(log_func):
-        try:
-            log_func(message, *args, **kwargs)
-        except TypeError:
-            formatted = message % args if args else message
-            log_func(formatted)
+        if args or kwargs:
+            try:
+                log_func(message, *args, **kwargs)
+            except TypeError:
+                formatted = message % args if args else message
+                log_func(formatted)
+        else:
+            log_func(message)
         return True
     elif callable(custom_logger):
-        try:
-            custom_logger(message, *args, **kwargs)
-        except TypeError:
-            formatted = message % args if args else message
-            custom_logger(formatted)
+        if args or kwargs:
+            try:
+                custom_logger(message, *args, **kwargs)
+            except TypeError:
+                formatted = message % args if args else message
+                custom_logger(formatted)
+        else:
+            custom_logger(message)
         return True
     return False
 
@@ -447,16 +694,45 @@ def _validate_async_wait_options(timeout, poll_interval):
     return timeout, poll_interval
 
 
-def _open_lock_handle(lock_path):
+def _open_raw_lock_file(lock_path, allow_readonly_fallback):
+    # Open existing files without O_CREAT / O_APPEND first so shared lock
+    # files in sticky directories (/tmp with fs.protected_regular=2) work
+    # across cooperating users and writes do not suffer O_APPEND semantics.
+    try:
+        return open(lock_path, "r+b", buffering=0)
+    except FileNotFoundError:
+        try:
+            return open(lock_path, "a+b", buffering=0)
+        except PermissionError:
+            if allow_readonly_fallback and os.name != "nt":
+                try:
+                    st = os.lstat(lock_path)
+                except OSError:
+                    st = None
+                if st is not None and stat.S_ISREG(st.st_mode):
+                    return open(lock_path, "rb", buffering=0)
+            raise
+    except PermissionError:
+        if allow_readonly_fallback and os.name != "nt":
+            try:
+                st = os.lstat(lock_path)
+            except OSError:
+                st = None
+            if st is not None and stat.S_ISREG(st.st_mode):
+                return open(lock_path, "rb", buffering=0)
+        raise
+
+
+def _open_lock_handle(lock_path, allow_readonly_fallback=False):
     lock_dir = os.path.dirname(lock_path)
     if lock_dir and not os.path.isdir(lock_dir):
         _prepare_directory(lock_dir)
 
     # Opening and registering the pending descriptor are atomic with respect to
-    # fork.  The potentially blocking OS lock call happens after the gate is
-    # released.
-    with _fork_gate:
-        handle = open(lock_path, "a+b", buffering=0)
+    # fork via shared read access on _fork_gate, without serializing opens
+    # across unrelated threads.
+    with _fork_gate.read_guard():
+        handle = _open_raw_lock_file(lock_path, allow_readonly_fallback)
         try:
             with _registry_lock:
                 _pending_handles.add(handle)
@@ -489,6 +765,7 @@ def _acquire_os_lock(handle, block):
         import msvcrt
 
         byte_prepared = False
+        backoff = 0.002
         while True:
             try:
                 if not byte_prepared:
@@ -503,7 +780,9 @@ def _acquire_os_lock(handle, block):
             except OSError as exc:
                 if not _is_lock_conflict(exc) or not block:
                     raise
-                time.sleep(0.05)
+                time.sleep(backoff)
+                if backoff < 0.05:
+                    backoff = min(0.05, backoff * 2)
 
     import fcntl
 
@@ -526,25 +805,6 @@ def _unlock_os_lock(handle):
     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _notify_async_waiters_locked(lock_path):
-    waiters = _async_waiters.pop(lock_path, None)
-    if not waiters:
-        return
-    try:
-        running_loop = asyncio.get_running_loop()
-    except RuntimeError:
-        running_loop = None
-
-    for waiter_loop, wake_event in waiters:
-        if running_loop is waiter_loop:
-            wake_event.set()
-        else:
-            try:
-                waiter_loop.call_soon_threadsafe(wake_event.set)
-            except RuntimeError:
-                pass
-
-
 def _wake_single_async_waiter(waiter_loop, wake_event):
     try:
         running_loop = asyncio.get_running_loop()
@@ -552,36 +812,101 @@ def _wake_single_async_waiter(waiter_loop, wake_event):
         running_loop = None
     if running_loop is waiter_loop:
         wake_event.set()
-    else:
-        try:
-            waiter_loop.call_soon_threadsafe(wake_event.set)
-        except RuntimeError:
-            pass
+        return True
+    try:
+        waiter_loop.call_soon_threadsafe(wake_event.set)
+        return True
+    except RuntimeError:
+        return False
+
+
+def _wake_next_sync_waiter_locked(lock_path):
+    queue = _sync_waiters.get(lock_path)
+    if not queue:
+        return
+    while queue:
+        waiter_event = queue.popleft()
+        if not waiter_event.is_set():
+            waiter_event.set()
+            break
+    if not queue:
+        _sync_waiters.pop(lock_path, None)
+
+
+def _wake_next_async_waiter_locked(lock_path):
+    queue = _async_waiters.get(lock_path)
+    if not queue:
+        return
+    while queue:
+        waiter_loop, wake_event = queue.popleft()
+        if wake_event.is_set():
+            continue
+        if _wake_single_async_waiter(waiter_loop, wake_event):
+            break
+    if not queue:
+        _async_waiters.pop(lock_path, None)
+
+
+def _notify_all_async_waiters_locked(lock_path):
+    queue = _async_waiters.pop(lock_path, None)
+    if not queue:
+        return
+    for waiter_loop, wake_event in queue:
+        if not wake_event.is_set():
+            _wake_single_async_waiter(waiter_loop, wake_event)
+
+
+def _wake_next_waiters_locked(lock_path):
+    _wake_next_sync_waiter_locked(lock_path)
+    _wake_next_async_waiter_locked(lock_path)
+
+
+def _activity_matches(lock_path, expected_event):
+    entry = _path_activity.get(lock_path)
+    return entry is not None and entry[0] is expected_event
 
 
 def _stage_release_locked(lock_path, info, purge_all_refs=False):
-    if purge_all_refs:
-        _purge_recorded_path(info["owner_thread"], lock_path)
+    owner_key = info.get("owner_ref")
+    if purge_all_refs and owner_key is not None:
+        _purge_recorded_path(owner_key, lock_path)
     _lock_file_handles.pop(lock_path, None)
     handle_to_close = info["handle"]
     release_event = info["released_event"]
     _pending_handles.add(handle_to_close)
-    _path_activity[lock_path] = release_event
-    return handle_to_close, release_event
+    _path_activity[lock_path] = (release_event, info["owner_thread_id"])
+    return handle_to_close, release_event, info.get("owner_done_cb"), owner_key
 
 
 def _finish_path_activity(lock_path, activity_event):
     with _registry_guard():
-        if _path_activity.get(lock_path) is activity_event:
+        if _activity_matches(lock_path, activity_event):
             _path_activity.pop(lock_path, None)
             activity_event.set()
-            _notify_async_waiters_locked(lock_path)
+            _wake_next_waiters_locked(lock_path)
 
 
-def _finalize_handle_release(lock_path, handle_to_close, release_event):
+def _finalize_handle_release(
+    lock_path,
+    handle_to_close,
+    release_event,
+    owner_done_cb=None,
+    owner_key=None,
+):
+    if owner_done_cb is not None and owner_key is not None:
+        live_owner = owner_key.resolve()
+        if live_owner is not None and live_owner is _current_owner():
+            try:
+                live_owner.remove_done_callback(owner_done_cb)
+            except Exception:
+                pass
+
     unlock_error = None
     try:
-        _unlock_os_lock(handle_to_close)
+        if handle_to_close.writable():
+            _unlock_os_lock(handle_to_close)
+        elif os.name != "nt":
+            _unlock_os_lock(handle_to_close)
     except OSError as exc:
         unlock_error = exc
     finally:
@@ -590,24 +915,69 @@ def _finalize_handle_release(lock_path, handle_to_close, release_event):
         finally:
             with _registry_guard():
                 _pending_handles.discard(handle_to_close)
-                if _path_activity.get(lock_path) is release_event:
+                if _activity_matches(lock_path, release_event):
                     _path_activity.pop(lock_path, None)
-                    release_event.set()
-                    _notify_async_waiters_locked(lock_path)
+                release_event.set()
+                _wake_next_waiters_locked(lock_path)
     return unlock_error
+
+
+def _drain_stale_locks(force_scan=False):
+    """Proactively reclaim FDs and bookkeeping left behind by dead owners."""
+    if _fork_gate.current_thread_active():
+        return
+
+    if not force_scan and not _stale_lock_paths and not _dead_owner_keys:
+        return
+
+    staged = []
+    with _registry_guard():
+        while _dead_owner_keys:
+            dead_key = _dead_owner_keys.popleft()
+            _thread_acquisitions.pop(dead_key, None)
+
+        candidate_paths = set()
+        while _stale_lock_paths:
+            candidate_paths.add(_stale_lock_paths.popleft())
+
+        if force_scan:
+            candidate_paths.update(_lock_file_handles.keys())
+            for owner_key in list(_thread_acquisitions.keys()):
+                if not _is_owner_alive(owner_key.resolve()):
+                    _thread_acquisitions.pop(owner_key, None)
+
+        for path in candidate_paths:
+            info = _lock_file_handles.get(path)
+            if info is not None and not _is_owner_alive(_resolve_info_owner(info)):
+                staged.append(
+                    (path,) + _stage_release_locked(path, info, purge_all_refs=True)
+                )
+
+    for path, handle_to_close, release_event, done_cb, owner_key in staged:
+        _finalize_handle_release(
+            path, handle_to_close, release_event, done_cb, owner_key
+        )
+
+
+def _maybe_housekeep():
+    global _acquire_op_counter
+    _acquire_op_counter += 1
+    need_scan = bool(_lock_file_handles) and (_acquire_op_counter & 0x1F) == 0
+    if _stale_lock_paths or _dead_owner_keys or need_scan:
+        _drain_stale_locks(force_scan=need_scan)
 
 
 def _claim_local_path(lock_path, logical_key, current_thread, block):
     """Claim the right to perform the OS acquisition for a local path."""
     while True:
-        wait_event = None
+        waiter_event = None
         conflict_owner = None
         stale_cleanup = None
 
         with _registry_guard():
             info = _lock_file_handles.get(lock_path)
             if info is not None:
-                owner = info["owner_thread"]
+                owner = _resolve_info_owner(info)
                 if owner is current_thread:
                     info["ref_count"] += 1
                     _record_acquisition(current_thread, logical_key, lock_path)
@@ -617,37 +987,81 @@ def _claim_local_path(lock_path, logical_key, current_thread, block):
                         lock_path, info, purge_all_refs=True
                     )
                 else:
-                    conflict_owner = _owner_identifier(owner)
-                    wait_event = info["released_event"]
+                    conflict_owner = info["owner_thread_id"]
+                    if block:
+                        waiter_event = threading.Event()
+                        _sync_waiters.setdefault(lock_path, deque()).append(
+                            waiter_event
+                        )
             else:
-                wait_event = _path_activity.get(lock_path)
-                if wait_event is None:
+                activity = _path_activity.get(lock_path)
+                if activity is None:
                     activity_event = threading.Event()
-                    _path_activity[lock_path] = activity_event
+                    _path_activity[lock_path] = (
+                        activity_event,
+                        _owner_identifier(current_thread),
+                    )
                     return "claimed", activity_event
+                conflict_owner = activity[1]
+                if block:
+                    waiter_event = threading.Event()
+                    _sync_waiters.setdefault(lock_path, deque()).append(waiter_event)
 
         if stale_cleanup is not None:
-            handle_to_close, release_event = stale_cleanup
-            _finalize_handle_release(lock_path, handle_to_close, release_event)
+            handle_to_close, release_event, done_cb, owner_key = stale_cleanup
+            _finalize_handle_release(
+                lock_path, handle_to_close, release_event, done_cb, owner_key
+            )
             continue
 
         if not block:
             return "conflict", conflict_owner
-        # Use a bounded wait so we notice promptly if a live owner crashes
-        # or exits without calling release_single().
-        wait_event.wait(timeout=0.2)
+
+        completed_normally = False
+        try:
+            # Bounded wait notices promptly if a live owner crashes without
+            # calling release_single().
+            waiter_event.wait(timeout=0.2)
+            completed_normally = True
+        finally:
+            with _registry_guard():
+                queue = _sync_waiters.get(lock_path)
+                if queue is not None:
+                    try:
+                        queue.remove(waiter_event)
+                    except ValueError:
+                        pass
+                    if not queue:
+                        _sync_waiters.pop(lock_path, None)
+                if (
+                    not completed_normally
+                    and waiter_event.is_set()
+                    and lock_path not in _lock_file_handles
+                    and lock_path not in _path_activity
+                ):
+                    _wake_next_waiters_locked(lock_path)
 
 
 def _rollback_acquired_handle(
     lock_path, handle, current_owner, activity_event, lock_info
 ):
     """Undo a failed in-memory commit after the OS lock was acquired."""
+    done_cb = lock_info.get("owner_done_cb")
+    if done_cb is not None:
+        try:
+            current_owner.remove_done_callback(done_cb)
+        except Exception:
+            pass
+
     with _registry_guard():
         if _lock_file_handles.get(lock_path) is lock_info:
             _lock_file_handles.pop(lock_path, None)
         _remove_recorded_path(current_owner, lock_path)
         _pending_handles.add(handle)
-        _path_activity[lock_path] = activity_event
+        _path_activity[lock_path] = (
+            activity_event,
+            _owner_identifier(current_owner),
+        )
 
     try:
         _unlock_os_lock(handle)
@@ -660,11 +1074,11 @@ def _rollback_acquired_handle(
     finally:
         with _registry_guard():
             _pending_handles.discard(handle)
-            if _path_activity.get(lock_path) is activity_event:
+            if _activity_matches(lock_path, activity_event):
                 _path_activity.pop(lock_path, None)
                 activity_event.set()
             lock_info["released_event"].set()
-            _notify_async_waiters_locked(lock_path)
+            _wake_next_waiters_locked(lock_path)
 
 
 def _fallback_after_open_error(lock_name, base_dir, lock_path, error):
@@ -690,18 +1104,46 @@ def _fallback_after_open_error(lock_name, base_dir, lock_path, error):
 
 def _try_fast_reentrant_acquire(current_owner, logical_key, lock_name, base_dir):
     if _depends_on_cwd(lock_name, base_dir):
-        return False
+        return None
     # Reuse the original path without re-running fallback logic for a
     # reentrant call made with the same cwd-independent logical arguments.
     with _registry_guard():
         recorded_path = _peek_recorded_path(current_owner, logical_key)
         if recorded_path is not None:
             info = _lock_file_handles.get(recorded_path)
-            if info is not None and info["owner_thread"] is current_owner:
+            if info is not None and _resolve_info_owner(info) is current_owner:
                 info["ref_count"] += 1
                 _record_acquisition(current_owner, logical_key, recorded_path)
-                return True
-    return False
+                return recorded_path
+    return None
+
+
+def _build_lock_info(handle, current_owner, lock_path):
+    def _on_owner_gc(_ref, _path=lock_path):
+        _stale_lock_paths.append(_path)
+
+    owner_ref = _OwnerKey(current_owner, on_collect=_on_owner_gc)
+    done_cb = None
+    if callable(getattr(current_owner, "add_done_callback", None)):
+
+        def _on_task_done(_task, _path=lock_path):
+            _stale_lock_paths.append(_path)
+            _drain_stale_locks()
+
+        try:
+            current_owner.add_done_callback(_on_task_done)
+            done_cb = _on_task_done
+        except Exception:
+            done_cb = None
+
+    return {
+        "handle": handle,
+        "owner_ref": owner_ref,
+        "owner_done_cb": done_cb,
+        "owner_thread_id": _owner_identifier(current_owner),
+        "ref_count": 1,
+        "released_event": threading.Event(),
+    }
 
 
 def _try_acquire_resolved(
@@ -712,6 +1154,7 @@ def _try_acquire_resolved(
     block,
     base_dir,
 ):
+    allow_ro_shared = base_dir is not None or not _is_bare_lock_name(lock_name)
     while True:
         claim, claim_data = _claim_local_path(
             lock_path, logical_key, current_owner, block
@@ -736,7 +1179,10 @@ def _try_acquire_resolved(
         committed = False
         try:
             try:
-                handle = _open_lock_handle(lock_path)
+                if allow_ro_shared:
+                    handle = _open_lock_handle(lock_path, allow_readonly_fallback=True)
+                else:
+                    handle = _open_lock_handle(lock_path)
             except OSError as exc:
                 _finish_path_activity(claimed_path, activity_event)
                 try:
@@ -773,21 +1219,13 @@ def _try_acquire_resolved(
 
             _write_lock_metadata(handle)
 
-            lock_info = {
-                "handle": handle,
-                "owner_thread": current_owner,
-                # Kept for diagnostics and compatibility with code inspecting
-                # the previous private registry shape.
-                "owner_thread_id": _owner_identifier(current_owner),
-                "ref_count": 1,
-                "released_event": threading.Event(),
-            }
+            lock_info = _build_lock_info(handle, current_owner, lock_path)
             try:
                 with _registry_guard():
                     _lock_file_handles[lock_path] = lock_info
                     _record_acquisition(current_owner, logical_key, lock_path)
                     _pending_handles.discard(handle)
-                    if _path_activity.get(claimed_path) is activity_event:
+                    if _activity_matches(claimed_path, activity_event):
                         _path_activity.pop(claimed_path, None)
                         activity_event.set()
                 committed = True
@@ -812,18 +1250,14 @@ def _try_acquire_resolved(
                     _finish_path_activity(claimed_path, activity_event)
 
 
-def force_single(
-    lock_name: Union[str, os.PathLike] = "yyds_instance.lock",
-    block: bool = False,
-    raise_on_conflict: bool = False,
-    base_dir: Optional[Union[str, os.PathLike]] = None,
-    logger: Any = None,
+def _acquire_single(
+    lock_name,
+    block=False,
+    raise_on_conflict=False,
+    base_dir=None,
+    custom_logger=None,
 ):
-    """Acquire a process-, thread-, and task-exclusive named file lock.
-
-    Repeated acquisition by the same live execution owner is reentrant.  The
-    matching number of ``release_single`` calls is required to release it.
-    """
+    _maybe_housekeep()
     logical_key = _logical_lock_key(lock_name, base_dir)
     lock_name = logical_key[0]
     current_thread = _current_owner()
@@ -833,8 +1267,11 @@ def force_single(
             "await force_single_async() instead"
         )
 
-    if _try_fast_reentrant_acquire(current_thread, logical_key, lock_name, base_dir):
-        return
+    fast_path = _try_fast_reentrant_acquire(
+        current_thread, logical_key, lock_name, base_dir
+    )
+    if fast_path is not None:
+        return fast_path, logical_key
 
     try:
         lock_path = _resolve_lock_path(lock_name, base_dir)
@@ -860,10 +1297,219 @@ def force_single(
             raise_on_conflict,
             detail,
             cause=cause,
-            custom_logger=logger,
+            custom_logger=custom_logger,
             owner_pid=owner_pid,
             owner_thread=owner_thread,
         )
+    return resolved_path, logical_key
+
+
+def force_single(
+    lock_name: Union[str, os.PathLike] = "yyds_instance.lock",
+    block: bool = False,
+    raise_on_conflict: bool = False,
+    base_dir: Optional[Union[str, os.PathLike]] = None,
+    logger: Any = None,
+):
+    """Acquire a process-, thread-, and task-exclusive named file lock.
+
+    Repeated acquisition by the same live execution owner is reentrant.  The
+    matching number of ``release_single`` calls is required to release it.
+    """
+    _acquire_single(
+        lock_name=lock_name,
+        block=block,
+        raise_on_conflict=raise_on_conflict,
+        base_dir=base_dir,
+        custom_logger=logger,
+    )
+
+
+async def _acquire_single_async(
+    lock_name="yyds_instance.lock",
+    timeout=None,
+    poll_interval=0.05,
+    base_dir=None,
+):
+    _maybe_housekeep()
+    timeout, poll_interval = _validate_async_wait_options(timeout, poll_interval)
+    deadline = None if timeout is None else time.monotonic() + timeout
+
+    logical_key = _logical_lock_key(lock_name, base_dir)
+    coerced_lock_name = logical_key[0]
+    current_owner = _current_owner()
+
+    fast_path = _try_fast_reentrant_acquire(
+        current_owner, logical_key, coerced_lock_name, base_dir
+    )
+    if fast_path is not None:
+        return fast_path, logical_key
+
+    try:
+        lock_path = _resolve_lock_path(coerced_lock_name, base_dir)
+    except OSError as exc:
+        raise _operation_error("prepare", coerced_lock_name, exc) from exc
+
+    loop = asyncio.get_running_loop()
+    is_poll_leader = False
+    acquired = False
+
+    try:
+        while True:
+            # Coalesce cross-process followers behind an active local poll
+            # leader so N coroutines do not hammer open()+flock() in parallel.
+            skip_try = False
+            if not is_poll_leader:
+                with _registry_guard():
+                    leader_interval = _async_poll_leaders.get(lock_path)
+                    if leader_interval is not None and leader_interval <= poll_interval:
+                        skip_try = True
+
+            if not skip_try:
+                status, new_path, detail, cause, _ = _try_acquire_resolved(
+                    coerced_lock_name,
+                    logical_key,
+                    lock_path,
+                    current_owner,
+                    False,
+                    base_dir,
+                )
+                if new_path != lock_path and is_poll_leader:
+                    with _registry_guard():
+                        _async_poll_leaders.pop(lock_path, None)
+                    is_poll_leader = False
+                lock_path = new_path
+
+                if status == "acquired":
+                    acquired = True
+                    return lock_path, logical_key
+            else:
+                detail = "Lock '{}' is already acquired by another process.".format(
+                    coerced_lock_name
+                )
+                cause = None
+
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                conflict_exc = AlreadyLockedError(detail)
+                if cause is not None:
+                    conflict_exc.__cause__ = cause
+                raise LockTimeoutError(
+                    "Timed out after {:.3f}s waiting for lock '{}'.".format(
+                        timeout, coerced_lock_name
+                    )
+                ) from conflict_exc
+
+            wait_entry = None
+            local_owner = None
+            owner_dead = False
+            with _registry_guard():
+                info = _lock_file_handles.get(lock_path)
+                local_busy = info is not None or lock_path in _path_activity
+                if info is not None:
+                    local_owner = _resolve_info_owner(info)
+                    if not _is_owner_alive(local_owner):
+                        owner_dead = True
+                        local_busy = False
+
+                if local_busy:
+                    if is_poll_leader:
+                        _async_poll_leaders.pop(lock_path, None)
+                        is_poll_leader = False
+                    wake_event = asyncio.Event()
+                    wait_entry = (loop, wake_event)
+                    _async_waiters.setdefault(lock_path, deque()).append(wait_entry)
+                elif not is_poll_leader:
+                    leader_interval = _async_poll_leaders.get(lock_path)
+                    if leader_interval is None or poll_interval < leader_interval:
+                        if cause is not None:
+                            _async_poll_leaders[lock_path] = poll_interval
+                            is_poll_leader = True
+                    else:
+                        wake_event = asyncio.Event()
+                        wait_entry = (loop, wake_event)
+                        _async_waiters.setdefault(lock_path, deque()).append(wait_entry)
+
+            if owner_dead:
+                await asyncio.sleep(0)
+                continue
+
+            if wait_entry is not None:
+                done_cb = None
+                same_loop_owner = (
+                    callable(getattr(local_owner, "add_done_callback", None))
+                    and getattr(local_owner, "get_loop", lambda: None)() is loop
+                )
+                if same_loop_owner:
+
+                    def _on_owner_done(_task, _loop=loop, _event=wake_event):
+                        _wake_single_async_waiter(_loop, _event)
+
+                    done_cb = _on_owner_done
+                    try:
+                        local_owner.add_done_callback(done_cb)
+                    except Exception:
+                        done_cb = None
+
+                completed_wait = False
+                try:
+                    # If a Thread, foreign event loop Task, or poll leader holds
+                    # the path, periodically re-check in case of abrupt death.
+                    if not same_loop_owner:
+                        step = 0.2 if remaining is None else min(0.2, remaining)
+                    else:
+                        step = remaining
+
+                    if step is None:
+                        await wake_event.wait()
+                    else:
+                        try:
+                            await asyncio.wait_for(wake_event.wait(), timeout=step)
+                        except asyncio.TimeoutError:
+                            pass
+                    completed_wait = True
+                finally:
+                    if done_cb is not None:
+                        try:
+                            local_owner.remove_done_callback(done_cb)
+                        except Exception:
+                            pass
+                    with _registry_guard():
+                        queue = _async_waiters.get(lock_path)
+                        if queue is not None:
+                            try:
+                                queue.remove(wait_entry)
+                            except ValueError:
+                                pass
+                            if not queue:
+                                _async_waiters.pop(lock_path, None)
+                        if (
+                            not completed_wait
+                            and wake_event.is_set()
+                            and lock_path not in _lock_file_handles
+                            and lock_path not in _path_activity
+                        ):
+                            _wake_next_waiters_locked(lock_path)
+            elif not is_poll_leader and cause is None:
+                # Local holder or leader just cleared; yield once and retry.
+                await asyncio.sleep(0)
+            else:
+                delay = (
+                    poll_interval
+                    if remaining is None
+                    else min(poll_interval, remaining)
+                )
+                await asyncio.sleep(delay)
+    finally:
+        if is_poll_leader:
+            with _registry_guard():
+                _async_poll_leaders.pop(lock_path, None)
+                if (
+                    not acquired
+                    and lock_path not in _lock_file_handles
+                    and lock_path not in _path_activity
+                ):
+                    _wake_next_async_waiter_locked(lock_path)
 
 
 async def force_single_async(
@@ -879,122 +1525,70 @@ async def force_single_async(
     so the event loop stays responsive.  A finite timeout raises
     ``LockTimeoutError`` when contention does not clear in time.
     """
-    timeout, poll_interval = _validate_async_wait_options(timeout, poll_interval)
-    deadline = None if timeout is None else time.monotonic() + timeout
+    del logger  # Retained for signature symmetry with force_single.
+    await _acquire_single_async(
+        lock_name=lock_name,
+        timeout=timeout,
+        poll_interval=poll_interval,
+        base_dir=base_dir,
+    )
 
-    logical_key = _logical_lock_key(lock_name, base_dir)
-    coerced_lock_name = logical_key[0]
-    current_owner = _current_owner()
 
-    if _try_fast_reentrant_acquire(
-        current_owner, logical_key, coerced_lock_name, base_dir
-    ):
-        return
-
-    try:
-        lock_path = _resolve_lock_path(coerced_lock_name, base_dir)
-    except OSError as exc:
-        raise _operation_error("prepare", coerced_lock_name, exc) from exc
-
-    loop = asyncio.get_running_loop()
-
-    while True:
-        status, lock_path, detail, cause, _ = _try_acquire_resolved(
-            coerced_lock_name,
-            logical_key,
-            lock_path,
-            current_owner,
-            False,
-            base_dir,
+def _emit_unlock_warning(lock_path, unlock_error, logger_arg):
+    if logger_arg is not None:
+        _emit_log(
+            logger_arg,
+            "warning",
+            "Unable to explicitly unlock '{}': {}".format(lock_path, unlock_error),
         )
-        if status == "acquired":
+    elif logger.hasHandlers():
+        logger.warning("Unable to explicitly unlock '%s': %s", lock_path, unlock_error)
+
+
+def _release_exact_path(
+    lock_path,
+    owner,
+    logical_key=None,
+    display_name=None,
+    logger_arg=None,
+    strict_owner=True,
+):
+    handle_to_close = None
+    release_event = None
+    done_cb = None
+    owner_key = None
+
+    with _registry_guard():
+        info = _lock_file_handles.get(lock_path)
+        if info is None:
+            return
+        info_owner = _resolve_info_owner(info)
+        if info_owner is not owner:
+            if not strict_owner:
+                return
+            raise RuntimeError(
+                "Cannot release lock '{}' owned by execution owner {} from owner {}.".format(
+                    display_name or lock_path,
+                    info["owner_thread_id"],
+                    _owner_identifier(owner),
+                )
+            )
+
+        _remove_recorded_path(owner, lock_path, preferred_key=logical_key)
+
+        info["ref_count"] -= 1
+        if info["ref_count"] > 0:
             return
 
-        remaining = None if deadline is None else deadline - time.monotonic()
-        if remaining is not None and remaining <= 0:
-            conflict_exc = AlreadyLockedError(detail)
-            if cause is not None:
-                conflict_exc.__cause__ = cause
-            raise LockTimeoutError(
-                "Timed out after {:.3f}s waiting for lock '{}'.".format(
-                    timeout, coerced_lock_name
-                )
-            ) from conflict_exc
+        handle_to_close, release_event, done_cb, owner_key = _stage_release_locked(
+            lock_path, info
+        )
 
-        wait_entry = None
-        local_owner = None
-        owner_dead = False
-        with _registry_guard():
-            info = _lock_file_handles.get(lock_path)
-            local_busy = info is not None or lock_path in _path_activity
-            if info is not None:
-                local_owner = info["owner_thread"]
-                if not _is_owner_alive(local_owner):
-                    owner_dead = True
-                    local_busy = False
-            if local_busy:
-                wake_event = asyncio.Event()
-                wait_entry = (loop, wake_event)
-                _async_waiters.setdefault(lock_path, set()).add(wait_entry)
-
-        if owner_dead:
-            await asyncio.sleep(0)
-            continue
-
-        if wait_entry is not None:
-            done_cb = None
-            same_loop_owner = (
-                callable(getattr(local_owner, "add_done_callback", None))
-                and getattr(local_owner, "get_loop", lambda: None)() is loop
-            )
-            if same_loop_owner:
-
-                def _on_owner_done(_task, _loop=loop, _event=wake_event):
-                    _wake_single_async_waiter(_loop, _event)
-
-                done_cb = _on_owner_done
-                try:
-                    local_owner.add_done_callback(done_cb)
-                except Exception:
-                    done_cb = None
-
-            try:
-                # If a Thread or foreign event loop Task holds the lock,
-                # periodically re-check in case that owner exits abruptly
-                # without calling release_single().
-                if not same_loop_owner:
-                    step = 0.2 if remaining is None else min(0.2, remaining)
-                else:
-                    step = remaining
-
-                if step is None:
-                    await wake_event.wait()
-                else:
-                    try:
-                        await asyncio.wait_for(wake_event.wait(), timeout=step)
-                    except asyncio.TimeoutError:
-                        pass
-            finally:
-                if done_cb is not None:
-                    try:
-                        local_owner.remove_done_callback(done_cb)
-                    except Exception:
-                        pass
-                with _registry_guard():
-                    waiters = _async_waiters.get(lock_path)
-                    if waiters is not None:
-                        waiters.discard(wait_entry)
-                        if not waiters:
-                            _async_waiters.pop(lock_path, None)
-        elif cause is None:
-            # A local holder released the lock between our check and registering
-            # the waiter; yield once and retry immediately.
-            await asyncio.sleep(0)
-        else:
-            delay = (
-                poll_interval if remaining is None else min(poll_interval, remaining)
-            )
-            await asyncio.sleep(delay)
+    unlock_error = _finalize_handle_release(
+        lock_path, handle_to_close, release_event, done_cb, owner_key
+    )
+    if unlock_error is not None:
+        _emit_unlock_warning(lock_path, unlock_error, logger_arg)
 
 
 def _release_single_for_owner(
@@ -1018,7 +1612,7 @@ def _release_single_for_owner(
         if candidate_path is not None:
             with _registry_guard():
                 info = _lock_file_handles.get(candidate_path)
-                if info is not None and info["owner_thread"] is owner:
+                if info is not None and _resolve_info_owner(info) is owner:
                     lock_path = candidate_path
 
     if lock_path is None:
@@ -1034,11 +1628,13 @@ def _release_single_for_owner(
 
     handle_to_close = None
     release_event = None
+    done_cb = None
+    owner_key = None
     with _registry_guard():
         info = _lock_file_handles.get(lock_path)
         if info is None:
             return
-        if info["owner_thread"] is not owner:
+        if _resolve_info_owner(info) is not owner:
             if not strict_owner:
                 return
             raise RuntimeError(
@@ -1049,8 +1645,6 @@ def _release_single_for_owner(
                 )
             )
 
-        # If the release path was an equivalent spelling rather than the
-        # original logical key, keep the acquisition bookkeeping balanced.
         if not used_recorded_path:
             _remove_recorded_path(owner, lock_path)
 
@@ -1058,23 +1652,15 @@ def _release_single_for_owner(
         if info["ref_count"] > 0:
             return
 
-        handle_to_close, release_event = _stage_release_locked(lock_path, info)
+        handle_to_close, release_event, done_cb, owner_key = _stage_release_locked(
+            lock_path, info
+        )
 
-    unlock_error = _finalize_handle_release(lock_path, handle_to_close, release_event)
-
+    unlock_error = _finalize_handle_release(
+        lock_path, handle_to_close, release_event, done_cb, owner_key
+    )
     if unlock_error is not None:
-        if logger_arg is not None:
-            _emit_log(
-                logger_arg,
-                "warning",
-                "Unable to explicitly unlock '%s': %s",
-                lock_path,
-                unlock_error,
-            )
-        elif logger.hasHandlers():
-            logger.warning(
-                "Unable to explicitly unlock '%s': %s", lock_path, unlock_error
-            )
+        _emit_unlock_warning(lock_path, unlock_error, logger_arg)
 
 
 def release_single(
@@ -1083,6 +1669,7 @@ def release_single(
     logger: Any = None,
 ):
     """Release one acquisition owned by the current execution owner."""
+    _maybe_housekeep()
     _release_single_for_owner(
         lock_name,
         _current_owner(),
@@ -1114,7 +1701,9 @@ class SingleInstanceLock:
         self.poll_interval = poll_interval
         self._acquired = False
         self._acquiring = False
-        self._owner = None
+        self._owner_ref = None
+        self._acquired_path = None
+        self._acquired_key = None
         self._state_lock = threading.Lock()
         self._pid = os.getpid()
         with _registry_guard():
@@ -1123,7 +1712,9 @@ class SingleInstanceLock:
     def _reset_after_fork(self, current_pid):
         self._acquired = False
         self._acquiring = False
-        self._owner = None
+        self._owner_ref = None
+        self._acquired_path = None
+        self._acquired_key = None
         self._state_lock = threading.Lock()
         self._pid = current_pid
 
@@ -1136,13 +1727,26 @@ class SingleInstanceLock:
                 if current_pid != self._pid:
                     self._acquired = False
                     self._acquiring = False
-                    self._owner = None
+                    self._owner_ref = None
+                    self._acquired_path = None
+                    self._acquired_key = None
                     self._pid = current_pid
 
     @property
     def acquired(self):
         self._reset_after_fork_if_needed()
-        return self._acquired
+        if not self._acquired:
+            return False
+        owner_ref = self._owner_ref
+        acquired_path = self._acquired_path
+        if owner_ref is None or acquired_path is None:
+            return False
+        owner = owner_ref.resolve()
+        if not _is_owner_alive(owner):
+            return False
+        with _registry_guard():
+            info = _lock_file_handles.get(acquired_path)
+            return info is not None and _resolve_info_owner(info) is owner
 
     def acquire(self):
         self._reset_after_fork_if_needed()
@@ -1151,21 +1755,23 @@ class SingleInstanceLock:
                 raise RuntimeError("This SingleInstanceLock object is already acquired")
             self._acquiring = True
 
-        acquired_ok = False
+        acquired_path = None
+        acquired_key = None
         try:
-            force_single(
-                self.lock_name,
+            acquired_path, acquired_key = _acquire_single(
+                lock_name=self.lock_name,
                 block=self.block,
                 raise_on_conflict=self.raise_on_conflict,
                 base_dir=self.base_dir,
-                logger=self.logger,
+                custom_logger=self.logger,
             )
-            acquired_ok = True
         finally:
             with self._state_lock:
                 self._acquiring = False
-                if acquired_ok:
-                    self._owner = _current_owner()
+                if acquired_path is not None:
+                    self._owner_ref = _OwnerKey(_current_owner())
+                    self._acquired_path = acquired_path
+                    self._acquired_key = acquired_key
                     self._acquired = True
         return self
 
@@ -1176,30 +1782,31 @@ class SingleInstanceLock:
                 raise RuntimeError("This SingleInstanceLock object is already acquired")
             self._acquiring = True
 
-        acquired_ok = False
+        acquired_path = None
+        acquired_key = None
         try:
             if self.block:
-                await force_single_async(
-                    self.lock_name,
+                acquired_path, acquired_key = await _acquire_single_async(
+                    lock_name=self.lock_name,
                     timeout=self.timeout,
                     poll_interval=self.poll_interval,
                     base_dir=self.base_dir,
-                    logger=self.logger,
                 )
             else:
-                force_single(
-                    self.lock_name,
+                acquired_path, acquired_key = _acquire_single(
+                    lock_name=self.lock_name,
                     block=False,
                     raise_on_conflict=self.raise_on_conflict,
                     base_dir=self.base_dir,
-                    logger=self.logger,
+                    custom_logger=self.logger,
                 )
-            acquired_ok = True
         finally:
             with self._state_lock:
                 self._acquiring = False
-                if acquired_ok:
-                    self._owner = _current_owner()
+                if acquired_path is not None:
+                    self._owner_ref = _OwnerKey(_current_owner())
+                    self._acquired_path = acquired_path
+                    self._acquired_key = acquired_key
                     self._acquired = True
         return self
 
@@ -1208,13 +1815,24 @@ class SingleInstanceLock:
         with self._state_lock:
             if not self._acquired:
                 return
-            if self._owner is not _current_owner():
+            current_owner = _current_owner()
+            owner = None if self._owner_ref is None else self._owner_ref.resolve()
+            if owner is not current_owner:
                 raise RuntimeError(
                     "SingleInstanceLock must be released by the execution owner that acquired it"
                 )
-            release_single(self.lock_name, self.base_dir, logger=self.logger)
+            _release_exact_path(
+                self._acquired_path,
+                current_owner,
+                logical_key=self._acquired_key,
+                display_name=self._acquired_key[0] if self._acquired_key else None,
+                logger_arg=self.logger,
+                strict_owner=True,
+            )
             self._acquired = False
-            self._owner = None
+            self._owner_ref = None
+            self._acquired_path = None
+            self._acquired_key = None
 
     def __enter__(self):
         return self.acquire()
@@ -1253,20 +1871,19 @@ def single_decorator(
                 resolved_lock_name = resolved_name(args, kwargs)
                 owner = _current_owner()
                 if block:
-                    await force_single_async(
-                        resolved_lock_name,
+                    acquired_path, acquired_key = await _acquire_single_async(
+                        lock_name=resolved_lock_name,
                         timeout=timeout,
                         poll_interval=poll_interval,
                         base_dir=base_dir,
-                        logger=logger,
                     )
                 else:
-                    force_single(
-                        resolved_lock_name,
+                    acquired_path, acquired_key = _acquire_single(
+                        lock_name=resolved_lock_name,
                         block=False,
                         raise_on_conflict=raise_on_conflict,
                         base_dir=base_dir,
-                        logger=logger,
+                        custom_logger=logger,
                     )
 
                 released = [False]
@@ -1274,10 +1891,11 @@ def single_decorator(
                 def release_once():
                     if not released[0]:
                         released[0] = True
-                        _release_single_for_owner(
-                            resolved_lock_name,
+                        _release_exact_path(
+                            acquired_path,
                             owner,
-                            base_dir=base_dir,
+                            logical_key=acquired_key,
+                            display_name=acquired_key[0],
                             logger_arg=logger,
                             strict_owner=False,
                         )
@@ -1328,26 +1946,33 @@ def single_decorator(
             @wraps(func)
             async def async_wrapper(*args, **kwargs):
                 resolved_lock_name = resolved_name(args, kwargs)
+                owner = _current_owner()
                 if block:
-                    await force_single_async(
-                        resolved_lock_name,
+                    acquired_path, acquired_key = await _acquire_single_async(
+                        lock_name=resolved_lock_name,
                         timeout=timeout,
                         poll_interval=poll_interval,
                         base_dir=base_dir,
-                        logger=logger,
                     )
                 else:
-                    force_single(
-                        resolved_lock_name,
+                    acquired_path, acquired_key = _acquire_single(
+                        lock_name=resolved_lock_name,
                         block=False,
                         raise_on_conflict=raise_on_conflict,
                         base_dir=base_dir,
-                        logger=logger,
+                        custom_logger=logger,
                     )
                 try:
                     return await func(*args, **kwargs)
                 finally:
-                    release_single(resolved_lock_name, base_dir, logger=logger)
+                    _release_exact_path(
+                        acquired_path,
+                        owner,
+                        logical_key=acquired_key,
+                        display_name=acquired_key[0],
+                        logger_arg=logger,
+                        strict_owner=True,
+                    )
 
             return async_wrapper
 
@@ -1359,20 +1984,21 @@ def single_decorator(
             def generator_wrapper(*args, **kwargs):
                 resolved_lock_name = resolved_name(args, kwargs)
                 owner = _current_owner()
-                force_single(
-                    resolved_lock_name,
-                    block,
-                    raise_on_conflict,
-                    base_dir,
-                    logger=logger,
+                acquired_path, acquired_key = _acquire_single(
+                    lock_name=resolved_lock_name,
+                    block=block,
+                    raise_on_conflict=raise_on_conflict,
+                    base_dir=base_dir,
+                    custom_logger=logger,
                 )
                 try:
                     yield from func(*args, **kwargs)
                 finally:
-                    _release_single_for_owner(
-                        resolved_lock_name,
+                    _release_exact_path(
+                        acquired_path,
                         owner,
-                        base_dir=base_dir,
+                        logical_key=acquired_key,
+                        display_name=acquired_key[0],
                         logger_arg=logger,
                         strict_owner=False,
                     )
@@ -1385,21 +2011,46 @@ def single_decorator(
         @wraps(func)
         def wrapper(*args, **kwargs):
             resolved_lock_name = resolved_name(args, kwargs)
-            force_single(
-                resolved_lock_name,
-                block,
-                raise_on_conflict,
-                base_dir,
-                logger=logger,
+            owner = _current_owner()
+            acquired_path, acquired_key = _acquire_single(
+                lock_name=resolved_lock_name,
+                block=block,
+                raise_on_conflict=raise_on_conflict,
+                base_dir=base_dir,
+                custom_logger=logger,
             )
             try:
                 return func(*args, **kwargs)
             finally:
-                release_single(resolved_lock_name, base_dir, logger=logger)
+                _release_exact_path(
+                    acquired_path,
+                    owner,
+                    logical_key=acquired_key,
+                    display_name=acquired_key[0],
+                    logger_arg=logger,
+                    strict_owner=True,
+                )
 
         return wrapper
 
     return decorator
+
+
+def _release_main_thread_locks():
+    """Release MainThread locks before threading._shutdown joins worker threads."""
+    main_thread = threading.main_thread()
+    staged = []
+    with _registry_guard():
+        for path, info in list(_lock_file_handles.items()):
+            if _resolve_info_owner(info) is main_thread:
+                staged.append(
+                    (path,) + _stage_release_locked(path, info, purge_all_refs=True)
+                )
+
+    for path, handle_to_close, release_event, done_cb, owner_key in staged:
+        _finalize_handle_release(
+            path, handle_to_close, release_event, done_cb, owner_key
+        )
 
 
 def _cleanup_all():
@@ -1413,7 +2064,8 @@ def _cleanup_all():
             id(handle): handle for handle in acquired_handles + pending_handles
         }
         all_handles = list(unique_handles.values())
-        activity_events = list(_path_activity.values())
+        activity_events = [entry[0] for entry in _path_activity.values()]
+        sync_queues = list(_sync_waiters.values())
         waiter_paths = list(_async_waiters.keys())
         _lock_file_handles.clear()
         # Keep every descriptor visible to the fork hook until it is actually
@@ -1421,13 +2073,20 @@ def _cleanup_all():
         _pending_handles.clear()
         _pending_handles.update(all_handles)
         _path_activity.clear()
+        _sync_waiters.clear()
+        _async_poll_leaders.clear()
         _thread_acquisitions.clear()
+        _stale_lock_paths.clear()
+        _dead_owner_keys.clear()
         for event in activity_events:
             event.set()
         for event in released_events:
             event.set()
+        for queue in sync_queues:
+            for waiter_event in queue:
+                waiter_event.set()
         for path in waiter_paths:
-            _notify_async_waiters_locked(path)
+            _notify_all_async_waiters_locked(path)
 
     acquired_set = set(acquired_handles)
     for handle in acquired_handles:
@@ -1452,16 +2111,18 @@ def _cleanup_all():
             _pending_handles.discard(handle)
 
 
+if hasattr(threading, "_register_atexit"):
+    threading._register_atexit(_release_main_thread_locks)
 atexit.register(_cleanup_all)
 
 
 if hasattr(os, "register_at_fork"):
 
     def _before_fork():
-        _fork_gate.acquire()
+        _fork_gate.write_acquire()
 
     def _after_fork_parent():
-        _fork_gate.release()
+        _fork_gate.write_release()
 
     def _after_fork_child():
         # Do not call LOCK_UN in the child: the open file description may be
@@ -1469,7 +2130,8 @@ if hasattr(os, "register_at_fork"):
         # the parent's lock intact.
         global _fork_gate, _registry_lock
         global _lock_file_handles, _pending_handles
-        global _path_activity, _async_waiters, _thread_acquisitions
+        global _path_activity, _sync_waiters, _async_waiters
+        global _async_poll_leaders, _thread_acquisitions
 
         handles = [info["handle"] for info in _lock_file_handles.values()]
         handles.extend(_pending_handles)
@@ -1486,12 +2148,16 @@ if hasattr(os, "register_at_fork"):
         _lock_file_handles = {}
         _pending_handles = set()
         _path_activity = {}
+        _sync_waiters = {}
         _async_waiters = {}
+        _async_poll_leaders = {}
         _thread_acquisitions = {}
+        _stale_lock_paths.clear()
+        _dead_owner_keys.clear()
         # Never acquire or release threading locks inherited from vanished
         # threads.  Fresh objects make the child immediately usable.
         _registry_lock = threading.Lock()
-        _fork_gate = threading.RLock()
+        _fork_gate = _ForkReadWriteGate()
         current_pid = os.getpid()
         for lock_instance in list(_live_lock_instances):
             lock_instance._reset_after_fork(current_pid)

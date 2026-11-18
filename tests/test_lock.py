@@ -1765,6 +1765,363 @@ with tempfile.TemporaryDirectory() as directory:
                 release_single("never_held.lock")
             self.assertFalse(os.path.exists(os.path.join(fake_home, ".yyds_lock")))
 
+    def test_nested_chdir_context_manager_and_decorator_release_exact_lock(self):
+        import tempfile
+        from yyds_lock import core
+
+        orig_cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dir1 = os.path.join(tmpdir, "dir1")
+            dir2 = os.path.join(tmpdir, "dir2")
+            os.makedirs(dir1)
+            os.makedirs(dir2)
+            p1 = os.path.realpath(os.path.join(dir1, "sub/ctx.lock"))
+            p2 = os.path.realpath(os.path.join(dir2, "sub/ctx.lock"))
+            try:
+                os.chdir(dir1)
+                with SingleInstanceLock("sub/ctx.lock", raise_on_conflict=True) as l1:
+                    os.chdir(dir2)
+                    with SingleInstanceLock(
+                        "sub/ctx.lock", raise_on_conflict=True
+                    ) as l2:
+                        l2.lock_name = "mutated_name.lock"
+                        os.chdir(dir1)
+                    self.assertIn(p1, core._lock_file_handles)
+                    self.assertNotIn(p2, core._lock_file_handles)
+                    self.assertTrue(l1.acquired)
+                    self.assertFalse(l2.acquired)
+                self.assertFalse(core._lock_file_handles)
+
+                @single_decorator("sub/dec.lock", raise_on_conflict=True)
+                def inner():
+                    os.chdir(dir1)
+
+                @single_decorator("sub/dec.lock", raise_on_conflict=True)
+                def outer():
+                    os.chdir(dir2)
+                    inner()
+                    d1 = os.path.realpath(os.path.join(dir1, "sub/dec.lock"))
+                    d2 = os.path.realpath(os.path.join(dir2, "sub/dec.lock"))
+                    self.assertIn(d1, core._lock_file_handles)
+                    self.assertNotIn(d2, core._lock_file_handles)
+
+                os.chdir(dir1)
+                outer()
+                self.assertFalse(core._lock_file_handles)
+            finally:
+                os.chdir(orig_cwd)
+
+    def test_loguru_style_unlock_warning_and_no_duplicate_typeerror_log(self):
+        import tempfile
+        from unittest.mock import patch
+        from yyds_lock import core
+
+        class LoguruLike:
+            def __init__(self):
+                self.warnings = []
+                self.error_calls = 0
+
+            def warning(self, msg, *args, **kwargs):
+                self.warnings.append(
+                    msg.format(*args, **kwargs) if (args or kwargs) else msg
+                )
+
+            def error(self, msg):
+                self.error_calls += 1
+                raise TypeError("internal logger bug")
+
+        log_inst = LoguruLike()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "loguru.lock")
+            canonical = os.path.realpath(lock_path)
+            force_single(lock_path, raise_on_conflict=True)
+            with patch.object(core, "_unlock_os_lock", side_effect=OSError("io fail")):
+                release_single(lock_path, logger=log_inst)
+
+            self.assertEqual(len(log_inst.warnings), 1)
+            self.assertIn(canonical, log_inst.warnings[0])
+            self.assertIn("io fail", log_inst.warnings[0])
+            self.assertNotIn("%s", log_inst.warnings[0])
+
+            force_single(lock_path, raise_on_conflict=True)
+
+            def bad_contender():
+                with self.assertRaisesRegex(TypeError, "internal logger bug"):
+                    force_single(lock_path, block=False, logger=log_inst)
+
+            th = threading.Thread(target=bad_contender)
+            th.start()
+            th.join()
+            release_single(lock_path)
+            self.assertEqual(log_inst.error_calls, 1)
+
+    def test_in_flight_path_activity_reports_real_owner_not_unknown(self):
+        import tempfile
+        from unittest.mock import patch
+        from yyds_lock import core
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "inflight.lock")
+            in_open = threading.Event()
+            allow_open = threading.Event()
+            orig_open = core._open_lock_handle
+
+            def slow_open(*args, **kwargs):
+                in_open.set()
+                allow_open.wait(timeout=2)
+                return orig_open(*args, **kwargs)
+
+            def holder():
+                force_single(lock_path, raise_on_conflict=True)
+                release_single(lock_path)
+
+            logs = []
+            t = threading.Thread(target=holder)
+            with patch.object(core, "_open_lock_handle", side_effect=slow_open):
+                t.start()
+                self.assertTrue(in_open.wait(timeout=2))
+                try:
+                    force_single(
+                        lock_path, block=False, logger=lambda m: logs.append(m)
+                    )
+                except SystemExit:
+                    pass
+                allow_open.set()
+                t.join(timeout=2)
+
+            self.assertEqual(len(logs), 1)
+            self.assertNotIn("[unknown]", logs[0])
+            self.assertIn(str(t.ident), logs[0])
+
+    def test_single_instance_lock_acquired_false_after_owner_death(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "dead_ctx.lock")
+            lock = SingleInstanceLock(lock_path, raise_on_conflict=True)
+            t = threading.Thread(target=lock.acquire)
+            t.start()
+            t.join()
+            self.assertFalse(lock.acquired)
+            force_single(lock_path, raise_on_conflict=True)
+            release_single(lock_path)
+
+    def test_private_directory_heals_missing_owner_write_permission(self):
+        import stat
+        import tempfile
+        from yyds_lock.core import _prepare_private_directory
+
+        if os.name == "nt" or not hasattr(os, "getuid"):
+            self.skipTest("POSIX directory permissions are unavailable")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            priv = os.path.join(tmpdir, "priv_ro")
+            os.mkdir(priv, mode=0o500)
+            try:
+                _prepare_private_directory(priv)
+                self.assertEqual(stat.S_IMODE(os.lstat(priv).st_mode), 0o700)
+            finally:
+                os.chmod(priv, 0o700)
+
+    def test_unvisited_dead_owner_locks_are_proactively_reclaimed(self):
+        import asyncio
+        import gc
+        import tempfile
+        from yyds_lock import core
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+
+            async def spawn_abandoned_tasks():
+                for idx in range(30):
+
+                    async def job(i=idx):
+                        force_single(
+                            os.path.join(tmpdir, f"abandoned_task_{i}.lock"),
+                            raise_on_conflict=True,
+                        )
+
+                    await asyncio.create_task(job())
+                await asyncio.sleep(0.01)
+
+            asyncio.run(spawn_abandoned_tasks())
+            self.assertFalse(core._lock_file_handles)
+            self.assertFalse(core._thread_acquisitions)
+
+            for idx in range(10):
+                p = os.path.join(tmpdir, f"abandoned_thread_{idx}.lock")
+                t = threading.Thread(
+                    target=lambda path=p: force_single(path, raise_on_conflict=True)
+                )
+                t.start()
+                t.join()
+                del t
+
+            gc.collect()
+            # Trigger housekeeping via a completely unrelated lock name.
+            unrelated = os.path.join(tmpdir, "trigger_housekeep.lock")
+            force_single(unrelated, raise_on_conflict=True)
+            release_single(unrelated)
+            self.assertFalse(core._lock_file_handles)
+            self.assertFalse(core._thread_acquisitions)
+
+    def test_readonly_shared_lock_file_fallback_on_posix(self):
+        import tempfile
+
+        if os.name == "nt":
+            self.skipTest("POSIX flock read-only fallback test")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ro_lock = os.path.join(tmpdir, "shared_ro.lock")
+            with open(ro_lock, "wb") as f:
+                f.write(b"12345\n")
+            os.chmod(ro_lock, 0o444)
+            try:
+                force_single(ro_lock, raise_on_conflict=True)
+                release_single(ro_lock)
+            finally:
+                os.chmod(ro_lock, 0o600)
+
+    def test_concurrent_opens_do_not_block_unrelated_locks_on_fork_gate(self):
+        import tempfile
+        from unittest.mock import patch
+        from yyds_lock import core
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            slow_path = os.path.realpath(os.path.join(tmpdir, "slow.lock"))
+            fast_path = os.path.realpath(os.path.join(tmpdir, "fast.lock"))
+            in_slow_open = threading.Event()
+            release_slow_open = threading.Event()
+            orig_raw_open = core._open_raw_lock_file
+
+            def hooked_raw_open(lock_path, allow_ro):
+                if os.path.realpath(lock_path) == slow_path:
+                    in_slow_open.set()
+                    release_slow_open.wait(timeout=2)
+                return orig_raw_open(lock_path, allow_ro)
+
+            def slow_worker():
+                force_single(slow_path, raise_on_conflict=True)
+                release_single(slow_path)
+
+            t = threading.Thread(target=slow_worker)
+            with patch.object(core, "_open_raw_lock_file", side_effect=hooked_raw_open):
+                t.start()
+                self.assertTrue(in_slow_open.wait(timeout=2))
+                t0 = time.monotonic()
+                for _ in range(10):
+                    force_single(fast_path, raise_on_conflict=True)
+                    release_single(fast_path)
+                fast_elapsed = time.monotonic() - t0
+                release_slow_open.set()
+                t.join(timeout=2)
+
+            self.assertLess(fast_elapsed, 0.5)
+
+    def test_cross_process_async_waiters_coalesce_behind_single_poll_leader(self):
+        import asyncio
+        import tempfile
+        from unittest.mock import patch
+        from yyds_lock import core
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_path = os.path.join(tmpdir, "coalesce.lock")
+            holder_code = (
+                "import sys, time\n"
+                "from yyds_lock import force_single\n"
+                "force_single(sys.argv[1], raise_on_conflict=True)\n"
+                "print('LOCKED', flush=True)\n"
+                "time.sleep(0.22)\n"
+            )
+            proc = subprocess.Popen(
+                [sys.executable, "-c", holder_code, lock_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                self.assertEqual(proc.stdout.readline().strip(), "LOCKED")
+                open_calls = []
+                orig_open = core._open_lock_handle
+
+                def spy_open(*args, **kwargs):
+                    open_calls.append(1)
+                    return orig_open(*args, **kwargs)
+
+                async def scenario():
+                    async def contender():
+                        await force_single_async(
+                            lock_path, timeout=3.0, poll_interval=0.04
+                        )
+                        await asyncio.sleep(0.002)
+                        release_single(lock_path)
+
+                    with patch.object(core, "_open_lock_handle", side_effect=spy_open):
+                        await asyncio.gather(*(contender() for _ in range(12)))
+
+                asyncio.run(scenario())
+                # 12 acquires + ~6 leader polls << 12 * 6 uncoalesced polls.
+                self.assertLess(len(open_calls), 30)
+            finally:
+                proc.wait(timeout=3)
+                proc.stdout.close()
+                proc.stderr.close()
+
+    def test_fifo_wakeup_order_for_async_and_sync_waiters(self):
+        import asyncio
+        import tempfile
+        from yyds_lock import core
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            async_lock = os.path.join(tmpdir, "fifo_async.lock")
+            async_order = []
+
+            async def async_scenario():
+                force_single(async_lock, raise_on_conflict=True)
+
+                async def waiter(idx):
+                    await force_single_async(async_lock, timeout=2.0, poll_interval=1.0)
+                    async_order.append(idx)
+                    release_single(async_lock)
+
+                tasks = []
+                for idx in range(5):
+                    tasks.append(asyncio.create_task(waiter(idx)))
+                    await asyncio.sleep(0.01)
+
+                release_single(async_lock)
+                await asyncio.gather(*tasks)
+
+            asyncio.run(async_scenario())
+            self.assertEqual(async_order, [0, 1, 2, 3, 4])
+
+            sync_lock = os.path.join(tmpdir, "fifo_sync.lock")
+            canonical_sync = os.path.realpath(sync_lock)
+            sync_order = []
+            force_single(sync_lock, raise_on_conflict=True)
+
+            def sync_waiter(idx):
+                force_single(sync_lock, block=True, raise_on_conflict=True)
+                sync_order.append(idx)
+                time.sleep(0.005)
+                release_single(sync_lock)
+
+            threads = []
+            for idx in range(4):
+                th = threading.Thread(target=sync_waiter, args=(idx,))
+                th.start()
+                threads.append(th)
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    with core._registry_guard():
+                        if len(core._sync_waiters.get(canonical_sync, ())) >= idx + 1:
+                            break
+                    time.sleep(0.002)
+
+            release_single(sync_lock)
+            for th in threads:
+                th.join(timeout=2)
+            self.assertEqual(sync_order, [0, 1, 2, 3])
+
 
 if __name__ == "__main__":
     unittest.main()
